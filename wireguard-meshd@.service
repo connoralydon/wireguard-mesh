@@ -1,0 +1,34 @@
+[Unit]
+Description=WireGuard mesh daemon for %i
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+WatchdogSec=10s
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=15s
+
+DynamicUser=yes
+# The daemon must resolve this systemd-owned symlink before journal directory checks.
+StateDirectory=wireguard-mesh-%i
+StateDirectoryMode=0700
+UMask=0077
+LoadCredential=config:/etc/wireguard-mesh/%i.json
+ExecStart=wireguard-meshd -wireguard %i -config %d/config -state /var/lib/wireguard-mesh-%i/recovery.json
+# Recovery uses only the journal, not the configuration credential.
+ExecStopPost=wireguard-meshd -wireguard %i -state /var/lib/wireguard-mesh-%i/recovery.json -restore
+
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX
+LimitCORE=0
+
+[Install]
+WantedBy=multi-user.target

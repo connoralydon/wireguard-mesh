@@ -60,18 +60,14 @@ func newController(client wgClient, name, journalPath string) (*controller, erro
 	} else if !errors.Is(err, os.ErrExist) {
 		return nil, err
 	}
-	info, err := os.Lstat(dir)
-	if err != nil {
+	if err := controlCheckDir(dir); err != nil {
 		return nil, err
-	}
-	if !info.IsDir() || info.Mode().Perm() != 0700 || info.Sys().(*syscall.Stat_t).Uid != uint32(os.Geteuid()) {
-		return nil, errors.New("journal directory must be owned by this user, mode 0700, and not a symlink")
 	}
 	c := &controller{client: client, path: journalPath}
 	f, err := os.OpenFile(journalPath, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err == nil {
 		defer f.Close()
-		info, err = f.Stat()
+		info, err := f.Stat()
 		if err != nil {
 			return nil, err
 		}
@@ -418,9 +414,23 @@ func controlSyncDir(path string) error {
 	return errors.Join(f.Sync(), f.Close())
 }
 
+func controlCheckDir(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() || info.Mode().Perm() != 0700 || info.Sys().(*syscall.Stat_t).Uid != uint32(os.Geteuid()) {
+		return errors.New("journal directory must be owned by this user, mode 0700, and not a symlink")
+	}
+	return nil
+}
+
 func (c *controller) save() error {
-	if info, err := os.Lstat(c.path); err == nil && !info.Mode().IsRegular() {
-		return errors.New("refuse to replace a non-regular journal file")
+	if err := controlCheckDir(filepath.Dir(c.path)); err != nil {
+		return err
+	}
+	if info, err := os.Lstat(c.path); err == nil && (!info.Mode().IsRegular() || info.Mode().Perm() != 0600 || info.Sys().(*syscall.Stat_t).Uid != uint32(os.Geteuid())) {
+		return errors.New("refuse to replace an unsafe journal file")
 	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
@@ -428,12 +438,18 @@ func (c *controller) save() error {
 	if err != nil {
 		return err
 	}
+	if len(data) > 1<<20 {
+		return errors.New("recovery journal exceeds 1 MiB")
+	}
 	f, err := os.CreateTemp(filepath.Dir(c.path), ".recovery-*")
 	if err != nil {
 		return err
 	}
 	defer os.Remove(f.Name())
-	if _, err = f.Write(data); err == nil {
+	if err = f.Chmod(0600); err == nil {
+		_, err = f.Write(data)
+	}
+	if err == nil {
 		err = f.Sync()
 	}
 	err = errors.Join(err, f.Close())

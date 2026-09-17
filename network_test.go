@@ -307,6 +307,33 @@ func TestNetworkChangedCoalesces(t *testing.T) {
 	}
 }
 
+func TestNetworkReadFailureCloses(t *testing.T) {
+	netw, err := openNetwork(0, []string{"mesh-test-missing"}, nil, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer netw.Close()
+	n := netw.(*udpNetwork)
+	if n.v4 == nil {
+		t.Skip("IPv4 socket unavailable")
+	}
+	// A closed socket is a permanent read error outside normal shutdown.
+	if err := n.v4.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case _, ok := <-n.Incoming():
+		if ok {
+			t.Fatal("received a packet instead of transport shutdown")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("permanent read failure did not close the transport")
+	}
+	if _, err := n.Links(); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("Links after read failure: %v", err)
+	}
+}
+
 func TestTunnelLink(t *testing.T) {
 	n, links := transportLoopback(t)
 	link, _ := transportFamily(t, n, links, true)
@@ -368,7 +395,7 @@ func TestNetworkValidation(t *testing.T) {
 
 func TestNetworkPartialFamily(t *testing.T) {
 	n, links := transportLoopback(t)
-	transportFamily(t, n, links, false)
+	link, target := transportFamily(t, n, links, false)
 	blocker, err := net.ListenUDP("udp4", &net.UDPAddr{})
 	if err != nil {
 		t.Fatal(err)
@@ -382,6 +409,12 @@ func TestNetworkPartialFamily(t *testing.T) {
 	defer other.Close()
 	if got := other.(*udpNetwork); got.v4 != nil || got.v6 == nil {
 		t.Fatal("did not retain only the available address family")
+	}
+	if err := other.Send([]byte("IPv6 fallback"), target, link); err != nil {
+		t.Fatal(err)
+	}
+	if p := transportPacket(t, n); string(p.Data) != "IPv6 fallback" || p.Source.Port() != uint16(port) {
+		t.Fatalf("remaining socket did not send: %+v", p)
 	}
 	if err := other.Close(); err != nil {
 		t.Fatal(err)

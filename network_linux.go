@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"net"
 	"net/netip"
 	"os"
@@ -16,7 +17,23 @@ func physicalInterface(name string) bool {
 }
 
 func interfacePrefixes(iface net.Interface) ([]netip.Prefix, error) {
-	addresses, err := netlink.AddrList(&netlink.Device{LinkAttrs: netlink.LinkAttrs{Index: iface.Index}}, netlink.FAMILY_ALL)
+	link, err := netlink.LinkByIndex(iface.Index)
+	if err != nil {
+		var missing netlink.LinkNotFoundError
+		if errors.As(err, &missing) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	attrs := link.Attrs()
+	if attrs.Name != iface.Name || attrs.Flags&net.FlagUp == 0 {
+		return nil, nil
+	}
+	switch attrs.OperState {
+	case netlink.OperDown, netlink.OperLowerLayerDown, netlink.OperNotPresent:
+		return nil, nil
+	}
+	addresses, err := netlink.AddrList(link, netlink.FAMILY_ALL)
 	if err != nil {
 		return nil, err
 	}

@@ -1,0 +1,7 @@
+/.direnv/
+/result
+/result-*
+/wireguard-mesh
+/wireguard-meshd
+/*.test
+/coverage.out

@@ -6,6 +6,17 @@ The hub remains the stable fallback. It does not need a new service, discovery s
 
 This follows the hub example and the runtime configuration model in `README.md`.
 
+## Implementation Constraints
+
+- Use Go and keep the service small. Use one package and one protocol event loop. Do not add a central discovery service, a metrics server, or a general routing framework.
+- Require an explicit WireGuard configuration/interface name with `-wireguard NAME`. Do not select a device automatically.
+- Use the known default discovery address `239.255.77.77:51821`. Keep the multicast groups and port configurable.
+- Provide a Nix development flake. Run builds and verification only on a separately approved Linux machine.
+- Do not run any further tests or builds on the development device. Do not run QEMU there. The QEMU scenarios below remain future external tests, not executed checks.
+- The first implementation supports one tunnel host address per peer and existing OS routes through the named Linux kernel WireGuard interface. Direct peers must not already exist in the stable WireGuard configuration. Their identities belong in the daemon's local peer list.
+- Do not install IPv6 link-local WireGuard endpoints while the pinned control library omits their scope IDs. IPv4 and global/ULA IPv6 endpoints remain candidates. Link-local multicast discovery remains enabled.
+- Unit tests, protocol simulations, UDP tests, fuzz tests, race tests, and opt-in Linux network-namespace tests supplement future QEMU tests. Do not claim these tests passed without executing them on an approved machine.
+
 ## Important Constraints
 
 1. **Discovery is separate from WireGuard.** The daemon uses ordinary UDP for multicast, broadcast, and probe messages. It uses the WireGuard control API to change peers and `AllowedIPs`.

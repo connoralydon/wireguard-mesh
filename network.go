@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"net/netip"
 	"slices"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
@@ -106,11 +108,10 @@ func openNetwork(port int, include, exclude []string, groups []netip.Addr, wgNam
 				conn.Close()
 			} else {
 				port = conn.LocalAddr().(*net.UDPAddr).Port
-				n.wg.Add(1)
-				go n.receive(family == "udp4")
 			}
 		}
 		if err != nil {
+			log.Printf("%s socket unavailable: %v", family, err)
 			setupErr = errors.Join(setupErr, fmt.Errorf("%s: %w", family, err))
 		}
 	}
@@ -126,6 +127,10 @@ func openNetwork(port int, include, exclude []string, groups []netip.Addr, wgNam
 		n.Close()
 		return nil, err
 	}
+	// Finish setup before a failed receiver can initiate shutdown.
+	n.wg.Add(2)
+	go n.receive(true)
+	go n.receive(false)
 	return n, nil
 }
 
@@ -165,6 +170,9 @@ func (n *udpNetwork) Send(data []byte, destination netip.AddrPort, link linkAddr
 
 func (n *udpNetwork) receive(v4 bool) {
 	defer n.wg.Done()
+	if (v4 && n.v4 == nil) || (!v4 && n.v6 == nil) {
+		return
+	}
 	// The extra byte distinguishes a full-size packet from any truncated packet.
 	var buffer [networkDatagramLimit + 1]byte
 	for {
@@ -186,10 +194,19 @@ func (n *udpNetwork) receive(v4 bool) {
 			}
 		}
 		if err != nil {
-			if errors.Is(err, net.ErrClosed) {
+			select {
+			case <-n.done:
 				return
+			default:
 			}
-			continue
+			var temporary net.Error
+			if errors.As(err, &temporary) && temporary.Temporary() {
+				time.Sleep(10 * time.Millisecond)
+				continue
+			}
+			log.Printf("UDP receive failed (IPv4=%t); closing transport: %v", v4, err)
+			go n.Close() // Close waits for this receiver to return.
+			return
 		}
 		destination, ok := netip.AddrFromSlice(dst)
 		if size > networkDatagramLimit || !ok || index <= 0 {
@@ -208,6 +225,7 @@ func (n *udpNetwork) receive(v4 bool) {
 	}
 }
 
+// Only failure to enumerate interfaces is fatal; individual failures are logged.
 func (n *udpNetwork) Links() ([]linkAddr, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -228,7 +246,8 @@ func (n *udpNetwork) Links() ([]linkAddr, error) {
 		}
 		prefixes, err := interfacePrefixes(iface)
 		if err != nil {
-			return nil, fmt.Errorf("addresses on %s: %w", iface.Name, err)
+			log.Printf("skip addresses on %s: %v", iface.Name, err)
+			continue
 		}
 		slices.SortFunc(prefixes, func(a, b netip.Prefix) int { return strings.Compare(a.String(), b.String()) })
 		for _, prefix := range prefixes {
@@ -257,13 +276,13 @@ func (n *udpNetwork) Links() ([]linkAddr, error) {
 	for key, prefixes := range wanted {
 		if _, ok := n.joined[key]; !ok {
 			if e := n.groupMembership(key, true); e != nil {
-				err = errors.Join(err, fmt.Errorf("join %s on %s: %w", key.group, key.name, e))
+				log.Printf("join %s on %s failed; will retry: %v", key.group, key.name, e)
 			} else {
 				n.joined[key] = prefixes
 			}
 		}
 	}
-	return links, err
+	return links, nil
 }
 
 func (n *udpNetwork) groupMembership(key membership, join bool) error {

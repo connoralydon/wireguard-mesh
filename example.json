@@ -1,0 +1,20 @@
+{
+  "address": "10.77.0.2",
+  "peers": [
+    {
+      "public_key": "REPLACE_WITH_REMOTE_WIREGUARD_PUBLIC_KEY",
+      "ip": "10.77.0.3"
+    }
+  ],
+  "port": 51821,
+  "multicast4": "239.255.77.77",
+  "multicast6": "ff12::5747:4d53",
+  "discovery_interval": "1m",
+  "broadcast_after": "5m",
+  "probe_interval": "1s",
+  "latency_window": "15s",
+  "failure_timeout": "5s",
+  "cooldown": "30s",
+  "minimum_gain": "2ms",
+  "minimum_gain_fraction": 0.2
+}
