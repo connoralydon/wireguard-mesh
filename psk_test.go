@@ -255,8 +255,8 @@ func TestMeshPSKFileMismatch(t *testing.T) {
 	writeTestPSK(t, s.nodes[0].p.spec.PresharedKeyFile, controlTestKey(44).String(), s.now)
 	s.run(25 * time.Second)
 	for _, n := range s.nodes {
-		if n.applies != 1 || n.applied || n.p.phase != "" || n.restores != 1 {
-			t.Fatal("different file keys did not fail the direct tunnel trial")
+		if n.applies != 0 || n.applied || n.p.phase != "" {
+			t.Fatal("different file keys passed key confirmation")
 		}
 	}
 }
@@ -282,7 +282,7 @@ func TestMeshPSKFileChangeCancelsCoordination(t *testing.T) {
 				if op == "apply" {
 					err = n.m.apply(n.p, s.now)
 				} else {
-					err = n.m.coordinate(n.p, candidate, message{op, token, n.other.m.wgPort}, s.now)
+					err = n.m.coordinate(n.p, candidate, message{Op: op, Token: token, Port: n.other.m.wgPort}, s.now)
 				}
 				if err != nil || n.applies != 1 || n.applied || n.p.selected != nil || n.p.phase != "" {
 					t.Fatal("key change did not cancel the pending coordination:", err)

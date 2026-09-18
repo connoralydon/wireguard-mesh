@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/netip"
 	"slices"
+	"strings"
 	"time"
 
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
@@ -26,6 +27,8 @@ type message struct {
 	Op    string `json:"op"`
 	Token string `json:"token"`
 	Port  uint16 `json:"port"`
+	Proof string `json:"proof,omitempty"`
+	Rekey bool   `json:"experimental_rekey,omitempty"`
 }
 
 type sample struct {
@@ -98,6 +101,12 @@ type meshPeer struct {
 	spec                             peerSpec
 	pskValid                         bool
 	pskLogAfter                      time.Time
+	pskStatus                        rosenpassResponse
+	rosenpassPath                    *path
+	rosenpassToken                   string
+	rekey                            *pskTransition
+	completedRekey                   *pskTransition
+	remoteRekey                      bool
 	paths                            map[string]*path
 	discovery                        map[linkAddr]*discovery
 	pending                          map[string]probe
@@ -112,24 +121,25 @@ type meshPeer struct {
 }
 
 type mesh struct {
-	c       config
-	net     network
-	control routeControl
-	crypto  *secure
-	public  wgtypes.Key
-	wgPort  uint16
-	tunnel  linkAddr
-	peers   map[wgtypes.Key]*meshPeer
-	starts  map[[16]byte]start
-	links   []linkAddr
-	dry     bool
-	notify  func()
-	verify  func() error
+	c         config
+	net       network
+	control   routeControl
+	crypto    *secure
+	public    wgtypes.Key
+	wgPort    uint16
+	tunnel    linkAddr
+	peers     map[wgtypes.Key]*meshPeer
+	starts    map[[16]byte]start
+	links     []linkAddr
+	dry       bool
+	notify    func()
+	verify    func() error
+	rosenpass func(string, rosenpassRequest) (rosenpassResponse, error)
 }
 
 func newMesh(c config, n network, control routeControl, private wgtypes.Key, port uint16, tunnel linkAddr, dry bool) *mesh {
 	m := &mesh{c: c, net: n, control: control, public: private.PublicKey(), wgPort: port, tunnel: tunnel, dry: dry,
-		peers: make(map[wgtypes.Key]*meshPeer), starts: make(map[[16]byte]start)}
+		peers: make(map[wgtypes.Key]*meshPeer), starts: make(map[[16]byte]start), rosenpass: queryRosenpass}
 	var keys []wgtypes.Key
 	for _, spec := range c.Peers {
 		keys = append(keys, spec.key)
@@ -262,7 +272,7 @@ func (m *mesh) receive(packet packet, now time.Time) error {
 		return nil
 	}
 	var msg message
-	if json.Unmarshal(event.Body, &msg) != nil || len(msg.Token) > 64 || msg.Token == "" || msg.Port == 0 {
+	if json.Unmarshal(event.Body, &msg) != nil || len(msg.Token) > 64 || len(msg.Proof) > 64 || msg.Token == "" || msg.Port == 0 {
 		return nil
 	}
 	var candidate *path
@@ -280,7 +290,7 @@ func (m *mesh) receive(packet packet, now time.Time) error {
 		if tunnel {
 			link = m.tunnel
 		}
-		m.send(event.ID, message{"pong", msg.Token, m.wgPort}, packet.Source, link, now)
+		m.send(event.ID, message{Op: "pong", Token: msg.Token, Port: m.wgPort}, packet.Source, link, now)
 		if lan {
 			candidate.incoming = event.ID
 		}
@@ -341,7 +351,7 @@ func (m *mesh) ping(p *meshPeer, candidate *path, id [16]byte, multicast bool, n
 		addr, link = candidate.addr, candidate.link
 	}
 	token := rand.Text()
-	if m.send(id, message{"ping", token, m.wgPort}, addr, link, now) {
+	if m.send(id, message{Op: "ping", Token: token, Port: m.wgPort}, addr, link, now) {
 		p.pending[token] = probe{candidate, now, id, multicast, candidate == nil || id == candidate.session}
 	}
 }
@@ -470,7 +480,7 @@ func (m *mesh) tick(now time.Time) error {
 				continue
 			}
 		}
-		if !pskOK || now.Before(p.cooldown) || bytes.Compare(m.public[:], p.spec.key[:]) >= 0 {
+		if !pskOK || p.rekey != nil || now.Before(p.cooldown) || bytes.Compare(m.public[:], p.spec.key[:]) >= 0 {
 			continue
 		}
 		var best *path
@@ -503,7 +513,9 @@ func (m *mesh) tick(now time.Time) error {
 func (m *mesh) command(p *meshPeer, op string, now time.Time) {
 	c := p.selected
 	if c != nil {
-		m.send(c.session, message{op, p.trial, m.wgPort}, c.addr, c.link, now)
+		msg := message{Op: op, Token: p.trial, Port: m.wgPort, Rekey: p.spec.ExperimentalRekey}
+		msg.Proof = pskProof(p.spec.psk, op, p.trial, m.public, p.spec.key)
+		m.send(c.session, msg, c.addr, c.link, now)
 	}
 }
 
@@ -511,15 +523,28 @@ func (m *mesh) coordinate(p *meshPeer, c *path, msg message, now time.Time) erro
 	if m.dry {
 		return nil
 	}
+	if msg.Op == "rosenpass-select" {
+		if p.spec.RosenpassSocket != "" && bytes.Compare(p.spec.key[:], m.public[:]) < 0 {
+			p.rosenpassPath, p.rosenpassToken = c, msg.Token
+		}
+		return nil
+	}
+	if strings.HasPrefix(msg.Op, "rekey-") {
+		return m.coordinateRekey(p, c, msg, now)
+	}
 	if msg.Op == "prepare" || msg.Op == "ready" || msg.Op == "commit" {
 		if ok, err := m.pollPSK(p, now); err != nil || !ok {
 			return err
 		}
+		if !checkPSKProof(p.spec.psk, msg, p.spec.key, m.public) {
+			return nil
+		}
 	}
-	if msg.Op == "prepare" && (p.phase == "" || p.phase == "active" && p.selected != c) && !now.Before(p.cooldown) && bytes.Compare(p.spec.key[:], m.public[:]) < 0 {
+	if msg.Op == "prepare" && p.rekey == nil && (p.phase == "" || p.phase == "active" && p.selected != c) && !now.Before(p.cooldown) && bytes.Compare(p.spec.key[:], m.public[:]) < 0 {
 		if base, ok := m.qualified(p, c, now); ok {
 			p.selected, p.phase, p.trial, p.since, p.baseline = c, "prepared", msg.Token, now, base
 			p.localGood, p.remoteGood, p.committed = false, false, false
+			p.remoteRekey = msg.Rekey
 			m.command(p, "ready", now)
 		}
 		return nil
@@ -534,6 +559,7 @@ func (m *mesh) coordinate(p *meshPeer, c *path, msg message, now time.Time) erro
 		}
 	case "ready":
 		if p.phase == "prepare" {
+			p.remoteRekey = msg.Rekey
 			m.command(p, "commit", now)
 			return m.apply(p, now)
 		}
@@ -591,6 +617,9 @@ func (m *mesh) apply(p *meshPeer, now time.Time) error {
 func (m *mesh) advance(p *meshPeer, now time.Time) error {
 	if !m.fresh(p.selected, now) {
 		return m.restore(p, now, "LAN health timeout")
+	}
+	if p.rekey != nil {
+		return m.advanceRekey(p, now)
 	}
 	switch p.phase {
 	case "prepare", "prepared":
@@ -650,6 +679,7 @@ func (m *mesh) restore(p *meshPeer, now time.Time, reason string) error {
 	slog.Info("stable path restored", "peer", p.spec.IP, "reason", reason)
 	p.selected, p.phase, p.trial = nil, "", ""
 	p.localGood, p.remoteGood, p.committed = false, false, false
+	p.rekey, p.completedRekey, p.remoteRekey = nil, nil, false
 	p.cooldown = now.Add(time.Duration(m.c.Cooldown))
 	p.tunnel, p.lastTunnel = measurements{since: now}, time.Time{}
 	p.pending = make(map[string]probe)

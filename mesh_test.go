@@ -363,7 +363,7 @@ func TestMeshUnsolicitedPongPreservesCandidate(t *testing.T) {
 	}
 	before := *c
 	id, _, _ := secureTestOpen(t, n.other.m.crypto, n.m.crypto, s.now)
-	if id == before.session || !n.other.m.send(id, message{"pong", "unsolicited", 65000}, netip.AddrPortFrom(n.lan.Prefix.Addr(), n.m.c.Port), n.other.lan, s.now) {
+	if id == before.session || !n.other.m.send(id, message{Op: "pong", Token: "unsolicited", Port: 65000}, netip.AddrPortFrom(n.lan.Prefix.Addr(), n.m.c.Port), n.other.lan, s.now) {
 		t.Fatal("could not send a pong on a different authenticated session")
 	}
 	s.run(time.Millisecond)
@@ -483,7 +483,9 @@ func TestMeshVerifyFailurePreventsConfiguration(t *testing.T) {
 	if err := n.m.tick(s.now); !errors.Is(err, injected) {
 		t.Fatal("tick did not return the preflight error:", err)
 	}
-	if err := n.m.coordinate(n.p, n.p.selected, message{"commit", n.p.trial, n.other.m.wgPort}, s.now); !errors.Is(err, injected) {
+	msg := message{Op: "commit", Token: n.p.trial, Port: n.other.m.wgPort}
+	msg.Proof = pskProof(n.p.spec.psk, msg.Op, msg.Token, n.other.m.public, n.m.public)
+	if err := n.m.coordinate(n.p, n.p.selected, msg, s.now); !errors.Is(err, injected) {
 		t.Fatal("commit did not return the preflight error:", err)
 	}
 	if calls != 2 || n.p.phase != "prepared" || n.applies != 0 || n.restores != 0 || n.other.applies != 0 || n.other.restores != 0 {

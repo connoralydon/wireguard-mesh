@@ -1,0 +1,30 @@
+[Unit]
+Description=Mesh-only Rosenpass adapter for %i
+After=network.target
+
+[Service]
+Type=simple
+# Create these fixed accounts and group before enabling this optional service.
+User=mesh-rosenpass-%i
+Group=mesh-psk-%i
+RuntimeDirectory=wireguard-mesh-rosenpass-%i
+RuntimeDirectoryMode=0750
+UMask=0027
+LoadCredential=config:/etc/wireguard-mesh/rosenpass-%i.json
+ExecStartPre=install -d -m 0700 /run/wireguard-mesh-rosenpass-%i/private
+ExecStart=wireguard-meshd -rosenpass-adapter %d/config
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=10s
+KillMode=control-group
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+LimitCORE=0
+
+[Install]
+WantedBy=multi-user.target

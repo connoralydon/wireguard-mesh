@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sync"
 	"syscall"
+	"time"
 
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
@@ -41,11 +42,12 @@ type controlJournal struct {
 }
 
 type controlPeer struct {
-	IP      netip.Addr
-	Owner   wgtypes.Key
-	Prefix  netip.Prefix
-	PSKHash [32]byte // A fingerprint detects edits without retaining the PSK.
-	Phase   string   // adding, active, restoring, or aborting a partial add.
+	IP          netip.Addr
+	Owner       wgtypes.Key
+	Prefix      netip.Prefix
+	PSKHash     [32]byte  // A fingerprint detects edits without retaining the PSK.
+	Phase       string    // planning, adding, active, rekeying, restoring, or aborting a partial add.
+	NextPSKHash *[32]byte `json:",omitempty"`
 }
 
 func newController(client wgClient, name, journalPath string) (*controller, error) {
@@ -100,7 +102,8 @@ func newController(client wgClient, name, journalPath string) (*controller, erro
 		key, err := wgtypes.ParseKey(text)
 		if err != nil || key.String() != text || r == nil || !controlHost(r.IP) || !r.Prefix.IsValid() || r.Prefix != r.Prefix.Masked() || !r.Prefix.Contains(r.IP) ||
 			key == (wgtypes.Key{}) || key == d.PublicKey || r.Owner == (wgtypes.Key{}) || r.Owner == key || r.Owner == d.PublicKey ||
-			c.journal.Peers[r.Owner.String()] != nil || ips[r.IP] || r.PSKHash == ([32]byte{}) || (r.Phase != "adding" && r.Phase != "active" && r.Phase != "restoring" && r.Phase != "aborting") {
+			c.journal.Peers[r.Owner.String()] != nil || ips[r.IP] || r.PSKHash == ([32]byte{}) || (r.Phase != "planning" && r.Phase != "adding" && r.Phase != "active" && r.Phase != "rekeying" && r.Phase != "restoring" && r.Phase != "aborting") ||
+			(r.Phase == "rekeying" && r.NextPSKHash == nil) || (r.NextPSKHash != nil && (*r.NextPSKHash == ([32]byte{}) || (r.Phase != "rekeying" && r.Phase != "restoring"))) {
 			return nil, errors.New("invalid journal peer ownership record")
 		}
 		ips[r.IP] = true
@@ -165,7 +168,7 @@ func (c *controller) Apply(key wgtypes.Key, ip netip.Addr, psk wgtypes.Key, endp
 		if owner == (wgtypes.Key{}) || owner == key || owner == d.PublicKey || c.journal.Peers[owner.String()] != nil {
 			return errors.New("host address has no independent stable WireGuard owner")
 		}
-		r = &controlPeer{ip, owner, prefix, sha256.Sum256(psk[:]), "adding"}
+		r = &controlPeer{IP: ip, Owner: owner, Prefix: prefix, PSKHash: sha256.Sum256(psk[:]), Phase: "planning"}
 		c.journal.Peers[key.String()] = r
 		if err := c.save(); err != nil {
 			return err
@@ -174,18 +177,22 @@ func (c *controller) Apply(key wgtypes.Key, ip netip.Addr, psk wgtypes.Key, endp
 	// Recheck after journal I/O. wgctrl has no compare-and-swap; external writers
 	// must be stopped or use the same lock to exclude the final read/write race.
 	d, err = c.device()
+	if err == nil && r.Phase == "planning" && controlFindPeer(d, key) != nil {
+		return errors.New("direct peer appeared before apply")
+	}
 	if err == nil {
 		err = c.checkPeer(d, key, r)
 	}
-	if err == nil && r.Phase == "adding" && controlFindPeer(d, key) != nil {
-		err = errors.New("direct peer appeared before apply")
-	}
 	if err != nil {
-		if r.Phase == "adding" {
-			delete(c.journal.Peers, key.String())
-			err = errors.Join(err, c.save())
-		}
 		return err
+	}
+	if r.Phase == "planning" {
+		r.Phase = "adding"
+		if err := c.save(); err != nil {
+			// No configuration was attempted; recovery must not adopt a present peer.
+			r.Phase = "planning"
+			return err
+		}
 	}
 	peer := wgtypes.PeerConfig{PublicKey: key, UpdateOnly: r.Phase == "active", Endpoint: net.UDPAddrFromAddrPort(endpoint)}
 	if r.Phase == "adding" {
@@ -208,6 +215,81 @@ func (c *controller) Apply(key wgtypes.Key, ip netip.Addr, psk wgtypes.Key, endp
 		return errors.Join(err, c.restore(key))
 	}
 	return nil
+}
+
+func (c *controller) Rekey(key, oldPSK, newPSK wgtypes.Key) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	r := c.journal.Peers[key.String()]
+	if r == nil || r.Phase != "active" {
+		return errors.New("rekey requires an active managed peer")
+	}
+	if newPSK == (wgtypes.Key{}) || r.PSKHash != sha256.Sum256(oldPSK[:]) {
+		return errors.New("rekey requires the current PSK and a nonzero new PSK")
+	}
+	expected := *r
+	check := func() error {
+		d, err := c.device()
+		if err != nil {
+			return err
+		}
+		for text, owned := range c.journal.Peers {
+			k, _ := wgtypes.ParseKey(text)
+			if k == key {
+				owned = &expected
+			}
+			if owned.Phase != "active" {
+				return errors.New("unfinished recovery; restore before rekeying")
+			}
+			if err := c.checkPeer(d, k, owned); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := check(); err != nil {
+		return err
+	}
+	next := sha256.Sum256(newPSK[:])
+	r.Phase, r.NextPSKHash = "rekeying", &next
+	if err := c.save(); err != nil {
+		return err
+	}
+	// Both hashes remain recoverable until the new key and ownership are verified.
+	if err := check(); err != nil {
+		return err
+	}
+	if err := c.client.ConfigureDevice(c.journal.Name, wgtypes.Config{Peers: []wgtypes.PeerConfig{{PublicKey: key, UpdateOnly: true, PresharedKey: &newPSK}}}); err != nil {
+		return err
+	}
+	expected.PSKHash = next
+	if err := check(); err != nil {
+		return err
+	}
+	pending := *r
+	*r = expected
+	if err := c.save(); err != nil {
+		*r = pending
+		return err
+	}
+	return nil
+}
+
+func (c *controller) Handshake(key wgtypes.Key) (time.Time, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	r := c.journal.Peers[key.String()]
+	if r == nil || r.Phase != "active" {
+		return time.Time{}, errors.New("handshake requires an active managed peer")
+	}
+	d, err := c.device()
+	if err != nil {
+		return time.Time{}, err
+	}
+	if err := c.checkPeer(d, key, r); err != nil {
+		return time.Time{}, err
+	}
+	return controlFindPeer(d, key).LastHandshakeTime, nil
 }
 
 func (c *controller) Restore(key wgtypes.Key) error {
@@ -236,12 +318,17 @@ func (c *controller) restore(key wgtypes.Key) error {
 	if err != nil {
 		return err
 	}
-	if err := c.checkPeer(d, key, r); err != nil {
+	expected := *r
+	if (r.Phase == "active" || r.Phase == "rekeying") && controlFindPeer(d, key) == nil {
+		// A reboot may already have recreated the baseline. Check its owner and prefix.
+		expected.Phase = "restoring"
+	}
+	if err := c.checkPeer(d, key, &expected); err != nil {
 		return err
 	}
 	if r.Phase == "adding" {
 		r.Phase = "aborting"
-	} else if r.Phase == "active" {
+	} else if r.Phase == "active" || r.Phase == "rekeying" {
 		r.Phase = "restoring"
 	}
 	// Persist intent even on retry: the previous save may have failed to sync.
@@ -334,15 +421,19 @@ func (c *controller) device() (*wgtypes.Device, error) {
 func (c *controller) checkPeer(d *wgtypes.Device, key wgtypes.Key, r *controlPeer) error {
 	conflict := fmt.Errorf("external change conflicts with managed peer %s", key)
 	p := controlFindPeer(d, key)
+	if r.Phase == "planning" && p != nil {
+		return conflict
+	}
 	exact := r.Prefix.Bits() == r.IP.BitLen()
 	partial := r.Phase == "adding" || r.Phase == "aborting"
-	if p == nil && r.Phase == "active" {
+	if p == nil && (r.Phase == "active" || r.Phase == "rekeying") {
 		return conflict
 	}
 	if p != nil {
 		empty := len(p.AllowedIPs) == 0
+		hash := sha256.Sum256(p.PresharedKey[:])
 		if p.PersistentKeepaliveInterval != 0 || p.ProtocolVersion < 0 || p.ProtocolVersion > 1 ||
-			(sha256.Sum256(p.PresharedKey[:]) != r.PSKHash && !(partial && empty && p.PresharedKey == (wgtypes.Key{}))) ||
+			(hash != r.PSKHash && !(r.NextPSKHash != nil && hash == *r.NextPSKHash) && !(partial && empty && p.PresharedKey == (wgtypes.Key{}))) ||
 			(!empty && (len(p.AllowedIPs) != 1 || p.AllowedIPs[0].String() != netip.PrefixFrom(r.IP, r.IP.BitLen()).String())) ||
 			(empty && !partial && !(exact && r.Phase == "restoring")) {
 			return conflict

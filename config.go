@@ -27,6 +27,8 @@ type peerSpec struct {
 	PresharedKey       string     `json:"preshared_key,omitempty"`
 	PresharedKeyFile   string     `json:"preshared_key_file,omitempty"`
 	PresharedKeyMaxAge *duration  `json:"preshared_key_max_age,omitempty"`
+	RosenpassSocket    string     `json:"rosenpass_socket,omitempty"`
+	ExperimentalRekey  bool       `json:"experimental_in_place_rekey,omitempty"`
 	key, psk           wgtypes.Key
 }
 
@@ -87,6 +89,7 @@ func readConfig(r io.Reader) (config, error) {
 		return c, errors.New("invalid timing or improvement policy; see README")
 	}
 	keys, ips := map[wgtypes.Key]bool{}, map[netip.Addr]bool{c.Address: true}
+	adapter := false
 	for i := range c.Peers {
 		p := &c.Peers[i]
 		var err error
@@ -106,6 +109,15 @@ func readConfig(r io.Reader) (config, error) {
 		}
 		if p.PresharedKeyMaxAge != nil && (*p.PresharedKeyMaxAge < duration(130*time.Second) || *p.PresharedKeyMaxAge > duration(3*time.Minute)) {
 			return c, fmt.Errorf("peer %d: preshared_key_max_age must be between 130s and 3m", i)
+		}
+		if p.RosenpassSocket != "" {
+			if adapter || !filepath.IsAbs(p.RosenpassSocket) || p.PresharedKeyFile == "" || p.RosenpassSocket == p.PresharedKeyFile {
+				return c, fmt.Errorf("peer %d: one Rosenpass adapter is supported; set an absolute socket and a separate PSK file", i)
+			}
+			adapter = true
+		}
+		if p.ExperimentalRekey && p.PresharedKeyFile == "" {
+			return c, fmt.Errorf("peer %d: experimental rekey requires a PSK file", i)
 		}
 		if p.PresharedKey != "" {
 			p.psk, err = wgtypes.ParseKey(p.PresharedKey)

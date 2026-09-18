@@ -120,6 +120,8 @@ Before a change, the daemon writes a private recovery journal. The default is `/
 
 On normal shutdown, restore the stable host ownership and remove newly added peers. On startup, recover the previous journal before accepting a new baseline. Conflicting external changes stop optimization and retain the journal instead of blindly overwriting those changes.
 
+An abrupt reboot can remove the direct peer before journal recovery. Recovery accepts this state only when the interface identity and stable owner match the journal. It checks the recorded prefix as well. Conflicting state retains the journal and stops recovery. Do not delete the journal to make startup succeed.
+
 For manual recovery, with the same user and capabilities:
 
 ```sh
@@ -134,65 +136,13 @@ The watchdog covers an unresponsive daemon. `ExecStopPost` runs journal recovery
 
 ### Rosenpass And Runtime Keys
 
-Rosenpass **0.2.3** was tested in file-output mode. Rosenpass negotiates the PSK; `wireguard-meshd` remains the only writer of direct WireGuard peers. Do not use Rosenpass's `device`/`peer` output or the `rp` wrapper on the managed interface.
+Rosenpass support is optional. The separate, unprivileged adapter supports **Rosenpass 0.2.3** and one mesh peer per node. Discovery supplies an authenticated LAN address before a PSK exists. The adapter does not use the hub's Rosenpass process.
 
-On B, replace the static peer PSK with a runtime file:
+An existing valid PSK is reused. Normal Rosenpass rekeys do not restart the process. Endpoint changes, process failure, expiry, and `stale` events invalidate its output. Both nodes must confirm key possession before a direct-path change. The PSK is not sent through discovery.
 
-```json
-{
-  "address": "10.77.0.2",
-  "peers": [{
-    "public_key": "C_WIREGUARD_PUBLIC_KEY",
-    "ip": "10.77.0.3",
-    "preshared_key_file": "/run/rosenpass/peer.psk",
-    "preshared_key_max_age": "3m"
-  }]
-}
-```
+The default key-change policy still returns to the stable hub path before a new direct trial. In-place rekey is an explicit experiment, disabled by default. A newer handshake timestamp does not prove which PSK created the session. The Linux prototype demonstrates this limit; zero packet loss is not promised.
 
-`preshared_key_file` must be absolute. It cannot be combined with `preshared_key`. The optional maximum file age defaults to `3m`; allowed values are `130s` through `3m`. Use the default to allow time for Rosenpass's normal 120–130 second rekey.
-
-The daemon checks the file on each probe tick and before a direct-route change:
-
-- A missing, expired, malformed, unsafe, or all-zero key prevents direct routing. The relay remains available.
-- An unchanged valid key does not cause a route change.
-- A changed key first restores the relay with the old recovery journal. The daemon then repeats qualification and the direct WireGuard trial with the new key.
-- A recovery conflict stops the operation. It does not replace the old journal or overwrite an external WireGuard change.
-
-This method causes a temporary return to the relay on every rekey. It is not an uninterrupted in-place PSK update. With default timers, recovery, cooldown, and qualification can take much longer than the short VM test timers.
-
-For B, use this Rosenpass TOML configuration:
-
-```toml
-public_key = "/var/lib/rosenpass/public"
-secret_key = "/var/lib/rosenpass/secret"
-listen = ["10.77.0.2:51822"]
-
-[[peers]]
-public_key = "/var/lib/rosenpass/peer-public"
-endpoint = "10.77.0.3:51822"
-key_out = "/run/rosenpass/peer.psk"
-```
-
-On C, reverse the tunnel addresses and use B's Rosenpass public key. Rosenpass keys are separate from WireGuard keys. Generate them with `rosenpass gen-keys --public-key PATH --secret-key PATH` in a private directory. Exchange public keys through a trusted channel. Never put private keys or PSK output in the Nix store.
-
-Run `rosenpass exchange-config /etc/rosenpass.toml` as a separate service user, without capabilities. Permit UDP port `51822` inside the existing tunnel. The initial exchange can use the relay; no direct LAN endpoint update is required. The test's [service configuration](tests/default.nix) is a working reference.
-
-For the dynamic-user mesh service, use a dedicated shared group such as `mesh-psk`:
-
-```ini
-# Drop-in for wireguard-meshd@wg0.service
-[Service]
-SupplementaryGroups=mesh-psk
-```
-
-Give only the Rosenpass producer write access to its runtime directory. Use `Group=mesh-psk`, `RuntimeDirectory=rosenpass`, `RuntimeDirectoryMode=0750`, and `UMask=0027` for that service. Its output will be readable by the mesh group, with mode `0640`. Keep the Rosenpass secret-key directory private to the producer, with mode `0700` and secret files with mode `0600`.
-
-The PSK file must be a regular file, not a symlink. It must contain one canonical base64 WireGuard key, with an optional final newline. Group write, access by others, execute bits, and special permission bits are rejected. The owner must be root, the daemon user, or a producer that shares a daemon group with group-read permission. All parent directories must be trusted; parent symlinks are not checked. Keep the file on a local filesystem so reads cannot block on a network filesystem.
-
-**Freshness limit:** file modification time is not proof of a successful Rosenpass exchange. Rosenpass can write a random replacement key when an exchange becomes stale. Different keys fail the direct tunnel trial and return traffic to the relay. A retained output file can remain usable until the age limit after producer failure. Remove output on service stop and before producer restart; do not restore old output files or refresh their timestamps. A partial in-place write can also cause a safe return to the relay. The daemon does not supervise Rosenpass or consume its exchange-status events.
-
-Rosenpass protects the direct WireGuard relationship only. It does not add post-quantum protection to discovery or to the existing relay links. This fallback policy is not a guarantee of end-to-end post-quantum protection.
+See [ROSENPASS.md](ROSENPASS.md) for configuration, fixed account permissions, exchange status, PSK reuse, experimental rekey, and test commands. Existing `preshared_key` and `preshared_key_file` configurations remain available without the adapter. Upgrade both nodes together when using PSKs: older daemons do not send the new possession proofs.
 
 ### Security Limits
 

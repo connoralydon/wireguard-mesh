@@ -111,6 +111,12 @@ func TestConfigPSKFile(t *testing.T) {
 		{`"preshared_key_file":"/run/rosenpass/peer.key","preshared_key_max_age":"181s"`, 0},
 		{`"preshared_key_file":"/run/rosenpass/peer.key","preshared_key_max_age":"SECRET"`, 0},
 		{`"preshared_key_max_age":"3m"`, 0},
+		{`"preshared_key_file":"/run/rosenpass/peer.key","rosenpass_socket":"/run/rosenpass/adapter.sock"`, 3 * time.Minute},
+		{`"preshared_key_file":"/run/rosenpass/peer.key","experimental_in_place_rekey":true`, 3 * time.Minute},
+		{`"rosenpass_socket":"/run/rosenpass/adapter.sock"`, 0},
+		{`"preshared_key_file":"/run/rosenpass/peer.key","rosenpass_socket":"relative.sock"`, 0},
+		{`"preshared_key_file":"/run/rosenpass/peer.key","rosenpass_socket":"/run/rosenpass/peer.key"`, 0},
+		{`"experimental_in_place_rekey":true`, 0},
 	} {
 		t.Run(tc.fields, func(t *testing.T) {
 			text := fmt.Sprintf(`{"address":"10.0.0.2","peers":[{"public_key":%q,"ip":"10.0.0.3",%s}]}`, controlTestKey(7).PublicKey().String(), tc.fields)

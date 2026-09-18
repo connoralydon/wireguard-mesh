@@ -34,11 +34,20 @@ func run(args []string) (err error) {
 	state := flags.String("state", "", "recovery journal (default /var/lib/wireguard-mesh-NAME/recovery.json)")
 	restore := flags.Bool("restore", false, "restore the journal and exit; no peer configuration needed")
 	dry := flags.Bool("dry-run", false, "discover and measure without changing WireGuard")
+	adapter := flags.String("rosenpass-adapter", "", "run the unprivileged mesh-only Rosenpass adapter with this JSON configuration")
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
 		}
 		return err
+	}
+	if *adapter != "" {
+		if *name != "" || *file != "" || *state != "" || *restore || *dry || flags.NArg() != 0 {
+			return errors.New("-rosenpass-adapter cannot be combined with daemon options")
+		}
+		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+		defer stop()
+		return runRosenpassAdapter(ctx, *adapter)
 	}
 	if !validName(*name) || flags.NArg() != 0 {
 		return errors.New("pass -wireguard NAME for one existing WireGuard interface")
