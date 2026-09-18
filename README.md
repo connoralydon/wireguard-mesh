@@ -144,13 +144,38 @@ The default key-change policy still returns to the stable hub path before a new 
 
 See [ROSENPASS.md](ROSENPASS.md) for configuration, fixed account permissions, exchange status, PSK reuse, experimental rekey, and test commands. Existing `preshared_key` and `preshared_key_file` configurations remain available without the adapter. Upgrade both nodes together when using PSKs: older daemons do not send the new possession proofs.
 
+### Discovery Privacy
+
+Protocol version 2 encrypts the complete daemon packet, including its header. Sender and recipient WireGuard public keys, message type, version, session ID, counters, and control contents are not sent in plaintext. This applies to multicast, broadcast, LAN unicast, and tunnel probes.
+
+No additional secret is required. Each node derives a pairwise secret with X25519 from its existing WireGuard private key and the configured peer public key. HKDF-SHA256 derives separate sending and receiving keys:
+
+```text
+shared = X25519(local_private, peer_public)
+key(sender, recipient) = HKDF-SHA256(
+    IKM  = shared,
+    salt = ASCII("wireguard-mesh/envelope/v2"),
+    info = sender_public[32] || recipient_public[32],
+    L    = 32)
+```
+
+Every UDP payload is exactly **512 bytes**. A fresh random 24-byte nonce precedes an XChaCha20-Poly1305 encrypted record and its 16-byte authentication tag. The encrypted record contains a two-byte big-endian inner length, the inner Noise packet, and zero padding. The associated data is the ASCII envelope domain above. There is no plaintext version marker or stable recipient tag. The maximum inner packet is 470 bytes; the maximum control body is 364 bytes.
+
+The receiver tries only configured peer keys, with a bounded work budget. It verifies the outer sender binding before the inner Noise protocol can change session state. Noise still performs its own authentication, replay checks, expiry, and key confirmation. The envelope does not replace those checks.
+
+**Upgrade all participating daemons together.** Version 1 plaintext-header packets are rejected, with no compatibility fallback. Stop the old daemons and complete journal recovery before replacing them. Keep the stable hub links available during the update. Configuration and WireGuard keys do not need to change. Mixed versions cannot establish mesh discovery sessions.
+
 ### Security Limits
 
-Discovery uses Noise IK with the configured X25519 identities. Packets have a separate protocol domain, directional session keys, counters, and replay windows. Each recipient gets a separately encrypted announcement. Public-key headers and packet timing are visible; multicast does not provide anonymity.
+Discovery uses Noise IK with the configured X25519 identities inside the encrypted envelope. Each recipient gets a separate announcement. **This remains classical cryptography, not post-quantum protection.** Neither the WireGuard PSK nor Rosenpass protects discovery.
+
+IP and MAC addresses, UDP ports, packet counts, and timing remain visible. Fixed size hides application length and explicit message types, but traffic patterns can still reveal communication relationships. Recorded requests can cause unconfirmed replies after session expiry. This is header privacy, not anonymity or resistance to traffic analysis.
+
+The outer envelope is not forward-secret. With the other peer's public key, compromise of either endpoint's WireGuard private key permits decryption of that pair's recorded outer headers. This does not by itself recover completed Noise session payloads. The envelope does not change WireGuard's own packet format, Rosenpass packets, or application traffic.
 
 The protocol does not inherit all WireGuard security properties or its optional preshared-key protection. The new peer's preshared key protects WireGuard traffic, not discovery. Identity-key reuse and the complete discovery protocol need independent review before production use.
 
-Resource limits include 128 configured peers, 16 candidate paths per peer, 64 sessions per peer, 512 sessions in total, and 1200-byte packets. These bounds can limit discovery on very large or heavily addressed networks.
+Resource limits include 128 configured peers, 16 candidate paths per peer, 64 sessions per peer, and 512 sessions in total. Outer decryption is limited to 131,072 key attempts per fixed one-second window. Successful attempts, rejected packets, and multicast packets for other recipients all consume this budget. At 128 configured peers, 1,024 unaddressed packets can consume a full window. The limiter permits bursts across window boundaries; it does not guarantee availability under a flood. These bounds and packet padding can limit discovery on large or heavily addressed networks. No claim is made that every maximum peer, interface, and probe-rate setting works together.
 
 IPv6 link-local discovery is available, but link-local **WireGuard endpoints** are not selected: the pinned `wgctrl` Linux encoder omits their scope IDs. Use IPv4 or global/ULA IPv6 LAN addresses for direct routes.
 
@@ -186,11 +211,12 @@ go build -mod=readonly -trimpath -o wireguard-meshd .
 go vet ./...
 CGO_ENABLED=1 go test -race -count=1 ./...
 go test -run='^$' -fuzz=FuzzSecureReceive -fuzztime=30s -parallel=2 .
+go test -run='^$' -fuzz=FuzzSecureInnerReceive -fuzztime=30s -parallel=2 .
 ```
 
 `path:.` includes new files in an uncommitted checkout. Alternatively, use Go 1.26 and a C compiler without Nix. The race detector requires cgo; a host with no C compiler can disable it by default.
 
-Tests include strict configuration parsing, encrypted packet exchange and replay rejection, fake-clock path selection, broadcast fallback, dry run, one-way loss, blocked WireGuard traffic, separate-LAN safety, journal recovery, and real loopback UDP transport. The separate-LAN test asserts no unsafe route change; it does not implement hole punching.
+Tests include strict configuration parsing, whole-packet privacy, KDF vectors, malformed envelopes, replay rejection, entropy failures, receive-work limits, fake-clock path selection, broadcast fallback, dry run, one-way loss, blocked WireGuard traffic, separate-LAN safety, journal recovery, and real loopback UDP transport. The separate-LAN test asserts no unsafe route change; it does not implement hole punching. The shared-LAN VM test captures multicast, broadcast, and unicast packets and checks their size and absence of plaintext identities.
 
 An additional Linux network-namespace test uses real kernel WireGuard and a three-node topology. It is skipped unless explicitly enabled. On a disposable Linux test machine with `ip`, `wg`, `tc`, `sysctl`, and `ping` installed:
 

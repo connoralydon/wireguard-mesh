@@ -19,6 +19,10 @@ let
     #!${pkgs.python3}/bin/python3
     ${builtins.readFile ./recovery_guest.py}
   '';
+  privacyGuest = pkgs.writeScriptBin "mesh-privacy-test" ''
+    #!${pkgs.python3}/bin/python3
+    ${builtins.readFile ./privacy_guest.py}
+  '';
   adapterGuest = pkgs.writeScriptBin "mesh-adapter-test" ''
     #!${pkgs.python3}/bin/python3
     ${builtins.readFile ./adapter_guest.py}
@@ -118,6 +122,7 @@ let
           mesh
           guest
           recoveryGuest
+          privacyGuest
           adapterGuest
           wireguard-tools
           iproute2

@@ -115,6 +115,8 @@ Use a separate authenticated protocol based on **Noise IK with X25519**, subject
 - Use the local WireGuard identity and the configured remote public key.
 - Give the protocol its own version and Noise prologue. Do not reuse WireGuard session keys or packet formats.
 - Send a separately encrypted discovery message for each permitted recipient.
+- Encrypt the complete header in a directional, static-X25519/HKDF-derived XChaCha20-Poly1305 envelope. Use fresh random nonces and fixed 512-byte UDP payloads. Do not expose public keys or a stable recipient tag.
+- Require version 2 envelopes, with no plaintext-header fallback. Bound trial decryption across configured peers before processing the inner packet.
 - Complete the response and confirmation exchange through unicast on the daemon port.
 - Check the authenticated peer identity against the local configuration before creating a candidate.
 - Accept endpoint candidates only on the receiving local network, using the observed source address and an authenticated advertised WireGuard port.
@@ -134,6 +136,8 @@ The protocol must also define:
 A recorded announcement must not change a route or keep a failed candidate alive. Require a fresh challenge response.
 
 Noise provides cryptographic building blocks, not the complete discovery protocol. Key reuse, packet framing, and replay handling need a separate review. Initial discovery messages must not be described as having the same forward-secrecy protection as an established session.
+
+The static-key envelope hides headers from outsiders but is not post-quantum or forward-secret after identity-key compromise. Network addresses, counts, and timing remain observable. Padding is not an anonymity guarantee. See the README for the current wire format and coordinated upgrade requirements.
 
 ## 5. Latency Measurement
 

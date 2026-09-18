@@ -82,6 +82,10 @@ try:
             assert all(int(n) > 500 for n in state(a)["transfer"][public[peer]].split())
         capture("initial-relay")
 
+    if mode == "same-lan":
+        for machine in [b, c]:
+            machine.succeed("mesh-privacy-test start", timeout=45)
+
     with subtest("hardened non-root daemon"):
         for machine in [b, c]:
             machine.succeed(f"systemctl start {unit}")
@@ -118,6 +122,15 @@ try:
             direct_traffic()
             capture("direct")
 
+        with subtest("packet privacy across multicast, broadcast, and unicast"):
+            for machine in [b, c]:
+                machine.succeed("mesh-privacy-test stop", timeout=30)
+            for machine in [b, c]:
+                machine.succeed("mesh-privacy-test check", timeout=45)
+            for machine in [b, c]:
+                machine.succeed("mesh-privacy-test cleanup", timeout=30)
+                machine.succeed(f"systemctl is-active {unit}", timeout=10)
+
         with subtest("LAN loss restores relay"):
             before = active_counts()
             for machine in [b, c]:
@@ -150,6 +163,9 @@ try:
         ping()
         capture("stopped")
 finally:
+    if mode == "same-lan":
+        for machine in [b, c]:
+            machine.execute("mesh-privacy-test cleanup", timeout=30)
     for machine in participants:
         machine.execute("mesh-test capture final")
         machine.copy_from_machine("/tmp/mesh-artifacts", machine.name)

@@ -30,7 +30,7 @@ func secureTestPair() (*secure, *secure, time.Time) {
 
 func secureTestReject(t testing.TB, s *secure, packet []byte, now time.Time) {
 	t.Helper()
-	event, err := s.Receive(packet, now)
+	event, err := s.receive(packet, now)
 	if err == nil || event.Peer != (wgtypes.Key{}) || event.ID != ([16]byte{}) || event.Ready || event.Body != nil || event.Reply != nil {
 		t.Fatal("rejected packet returned success or an event")
 	}
@@ -38,25 +38,26 @@ func secureTestReject(t testing.TB, s *secure, packet []byte, now time.Time) {
 
 func secureTestOpen(t testing.TB, a, b *secure, now time.Time) ([16]byte, []byte, []byte) {
 	t.Helper()
-	id, request, err := a.Start(b.public, now)
+	// Return inner packets for Noise tests; mesh tests only need the session.
+	id, request, err := a.start(b.public, now)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if id == ([16]byte{}) || len(request) != secureHeaderN+96 {
 		t.Fatal("invalid request framing")
 	}
-	if _, err := a.Seal(id, []byte("too soon"), now); err == nil {
+	if _, err := a.seal(id, []byte("too soon"), now); err == nil {
 		t.Fatal("initiator sent data before the response")
 	}
-	event, err := b.Receive(request, now)
+	event, err := b.receive(request, now)
 	if err != nil || event.Peer != a.public || event.ID != id || event.Ready || event.Body != nil || len(event.Reply) != secureHeaderN+48 {
 		t.Fatal("invalid request event:", err)
 	}
-	if _, err := b.Seal(id, []byte("too soon"), now); err == nil {
+	if _, err := b.seal(id, []byte("too soon"), now); err == nil {
 		t.Fatal("responder sent data before key confirmation")
 	}
 	reply := event.Reply
-	event, err = a.Receive(reply, now)
+	event, err = a.receive(reply, now)
 	if err != nil || event.Peer != b.public || event.ID != id || !event.Ready || event.Body != nil || event.Reply != nil {
 		t.Fatal("invalid response event:", err)
 	}
@@ -65,11 +66,11 @@ func secureTestOpen(t testing.TB, a, b *secure, now time.Time) ([16]byte, []byte
 
 func secureTestSend(t testing.TB, a, b *secure, id [16]byte, body []byte, now time.Time) []byte {
 	t.Helper()
-	packet, err := a.Seal(id, body, now)
+	packet, err := a.seal(id, body, now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	event, err := b.Receive(packet, now)
+	event, err := b.receive(packet, now)
 	if err != nil || !event.Ready || event.ID != id || event.Peer != a.public || !bytes.Equal(event.Body, body) || event.Reply != nil {
 		t.Fatal("invalid data event:", err)
 	}
@@ -98,12 +99,12 @@ func TestSecureUnknownAndInvalidKeys(t *testing.T) {
 	a, b, now := secureTestPair()
 	unknown := secureTestKey(3)
 	for _, peer := range []wgtypes.Key{unknown.PublicKey(), a.public, {}} {
-		if _, _, err := a.Start(peer, now); err == nil {
+		if _, _, err := a.start(peer, now); err == nil {
 			t.Fatal("invalid or unknown peer accepted")
 		}
 	}
 	outsider := newSecure(unknown, []wgtypes.Key{b.public})
-	_, request, err := outsider.Start(b.public, now)
+	_, request, err := outsider.start(b.public, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,11 +113,11 @@ func TestSecureUnknownAndInvalidKeys(t *testing.T) {
 		t.Fatal("unknown key allocated state")
 	}
 	disabled := newSecure(wgtypes.Key{}, []wgtypes.Key{a.public})
-	if _, _, err := disabled.Start(a.public, now); err == nil {
+	if _, _, err := disabled.start(a.public, now); err == nil {
 		t.Fatal("missing local private key accepted")
 	}
 	secureTestReject(t, disabled, request, now)
-	_, request, err = a.Start(b.public, now)
+	_, request, err = a.start(b.public, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,13 +146,13 @@ func TestSecureHandshakeTamper(t *testing.T) {
 	for _, kind := range []byte{secureRequest, secureReply} {
 		for _, offset := range []int{0, 1, 2, 34, 66, 81, 82, 89, 90, 121, 137} {
 			a, b, now := secureTestPair()
-			id, request, err := a.Start(b.public, now)
+			id, request, err := a.start(b.public, now)
 			if err != nil {
 				t.Fatal(err)
 			}
 			packet, receiver := request, b
 			if kind == secureReply {
-				event, err := b.Receive(request, now)
+				event, err := b.receive(request, now)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -163,7 +164,7 @@ func TestSecureHandshakeTamper(t *testing.T) {
 			if kind == secureRequest && len(b.sessions) != 0 {
 				t.Fatal("forged initial request allocated a session")
 			}
-			if _, err := receiver.Receive(packet, now); err != nil {
+			if _, err := receiver.receive(packet, now); err != nil {
 				t.Fatalf("kind %d offset %d spoiled valid handshake: %v", kind, offset, err)
 			}
 			if receiver.sessions[id] == nil {
@@ -173,18 +174,18 @@ func TestSecureHandshakeTamper(t *testing.T) {
 	}
 	// X25519 rejects this response before Noise's normal rollback path.
 	a, b, now := secureTestPair()
-	id, request, err := a.Start(b.public, now)
+	id, request, err := a.start(b.public, now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	event, err := b.Receive(request, now)
+	event, err := b.receive(request, now)
 	if err != nil {
 		t.Fatal(err)
 	}
 	bad := bytes.Clone(event.Reply)
 	clear(bad[secureHeaderN : secureHeaderN+32])
 	secureTestReject(t, a, bad, now)
-	if _, err := a.Receive(event.Reply, now); err != nil {
+	if _, err := a.receive(event.Reply, now); err != nil {
 		t.Fatal("low-order ephemeral spoiled pending state:", err)
 	}
 	secureTestSend(t, a, b, id, []byte("still usable"), now)
@@ -227,7 +228,7 @@ func TestSecureHandshakeIdentityDomainAndPayload(t *testing.T) {
 		})
 	}
 	a, b, now := secureTestPair()
-	id, request, err := a.Start(b.public, now)
+	id, request, err := a.start(b.public, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -243,11 +244,11 @@ func TestSecureHandshakeIdentityDomainAndPayload(t *testing.T) {
 		t.Fatal(err)
 	}
 	secureTestReject(t, a, reply, now)
-	event, err := b.Receive(request, now)
+	event, err := b.receive(request, now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := a.Receive(event.Reply, now); err != nil {
+	if _, err := a.receive(event.Reply, now); err != nil {
 		t.Fatal("payload rejection spoiled pending handshake:", err)
 	}
 }
@@ -255,7 +256,7 @@ func TestSecureHandshakeIdentityDomainAndPayload(t *testing.T) {
 func TestSecureTamperPreservesReplayState(t *testing.T) {
 	a, b, now := secureTestPair()
 	id, _, _ := secureTestOpen(t, a, b, now)
-	packet, err := a.Seal(id, []byte("authenticate before committing state"), now)
+	packet, err := a.seal(id, []byte("authenticate before committing state"), now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -272,7 +273,7 @@ func TestSecureTamperPreservesReplayState(t *testing.T) {
 	bad := bytes.Clone(packet)
 	binary.BigEndian.PutUint64(bad[82:90], noise.MaxNonce)
 	secureTestReject(t, b, bad, now)
-	if event, err := b.Receive(packet, now); err != nil || !event.Ready {
+	if event, err := b.receive(packet, now); err != nil || !event.Ready {
 		t.Fatal("forgery burned the valid counter:", err)
 	}
 	secureTestReject(t, b, packet, now)
@@ -281,32 +282,32 @@ func TestSecureTamperPreservesReplayState(t *testing.T) {
 
 func TestSecureLossReorderAndWindow(t *testing.T) {
 	a, b, now := secureTestPair()
-	_, lost, err := a.Start(b.public, now)
+	_, lost, err := a.start(b.public, now)
 	if err != nil || len(lost) == 0 {
 		t.Fatal("could not create lost request:", err)
 	}
-	id, request, err := a.Start(b.public, now)
+	id, request, err := a.start(b.public, now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := b.Receive(request, now); err != nil {
+	if _, err := b.receive(request, now); err != nil {
 		t.Fatal(err)
 	}
 	// A lost response requires a new Start, not replay of an old request.
 	secureTestReject(t, b, request, now)
-	if _, err := a.Seal(id, []byte("response was lost"), now); err == nil {
+	if _, err := a.seal(id, []byte("response was lost"), now); err == nil {
 		t.Fatal("lost response still permitted data")
 	}
 	id, _, _ = secureTestOpen(t, a, b, now)
 	packets := make([][]byte, 71)
 	for i := range packets {
-		packets[i], err = a.Seal(id, []byte{byte(i)}, now)
+		packets[i], err = a.seal(id, []byte{byte(i)}, now)
 		if err != nil {
 			t.Fatal(err)
 		}
 	}
 	for _, i := range []int{70, 7, 9, 8, 69} {
-		event, err := b.Receive(packets[i], now)
+		event, err := b.receive(packets[i], now)
 		if err != nil || !bytes.Equal(event.Body, []byte{byte(i)}) {
 			t.Fatalf("in-window packet %d rejected: %v", i, err)
 		}
@@ -322,13 +323,13 @@ func TestSecureExpiry(t *testing.T) {
 	for _, established := range []bool{false, true} {
 		for _, operation := range []string{"start", "receive", "seal"} {
 			a, b, now := secureTestPair()
-			id, _, err := a.Start(b.public, now)
+			id, _, err := a.start(b.public, now)
 			if err != nil {
 				t.Fatal(err)
 			}
 			ttl := 10 * time.Second
 			if established {
-				// Remove the extra pending session through the public expiry path.
+				// Remove the extra pending session through the inner expiry path.
 				now = now.Add(ttl)
 				id, _, _ = secureTestOpen(t, a, b, now)
 				ttl = 10 * time.Minute
@@ -338,11 +339,11 @@ func TestSecureExpiry(t *testing.T) {
 			at := now.Add(ttl)
 			switch operation {
 			case "start":
-				_, _, _ = a.Start(wgtypes.Key{}, at)
+				_, _, _ = a.start(wgtypes.Key{}, at)
 			case "receive":
 				secureTestReject(t, a, nil, at)
 			case "seal":
-				if _, err := a.Seal(id, []byte("expired"), at); err == nil {
+				if _, err := a.seal(id, []byte("expired"), at); err == nil {
 					t.Fatal("expired session sealed data")
 				}
 			}
@@ -353,7 +354,7 @@ func TestSecureExpiry(t *testing.T) {
 	}
 	a, b, now := secureTestPair()
 	id, request, reply := secureTestOpen(t, a, b, now)
-	packet, err := a.Seal(id, []byte("delayed confirmation"), now)
+	packet, err := a.seal(id, []byte("delayed confirmation"), now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -373,7 +374,7 @@ func TestSecureExpiry(t *testing.T) {
 	}
 	secureTestReject(t, b, packet, now.Add(10*time.Minute))
 	// After expiry, an old request can only create unconfirmed, short-lived state.
-	event, err := b.Receive(request, now.Add(10*time.Minute))
+	event, err := b.receive(request, now.Add(10*time.Minute))
 	if err != nil || event.Ready || event.Body != nil || len(event.Reply) == 0 {
 		t.Fatal("recorded request bypassed fresh confirmation:", err)
 	}
@@ -381,11 +382,11 @@ func TestSecureExpiry(t *testing.T) {
 		t.Fatal("responder reused its ephemeral key")
 	}
 	secureTestReject(t, b, packet, now.Add(10*time.Minute))
-	if _, err := b.Seal(id, []byte("not confirmed"), now.Add(10*time.Minute)); err == nil {
+	if _, err := b.seal(id, []byte("not confirmed"), now.Add(10*time.Minute)); err == nil {
 		t.Fatal("recorded request permitted application data")
 	}
 	restarted := newSecure(b.private, []wgtypes.Key{a.public})
-	event, err = restarted.Receive(request, now.Add(10*time.Minute))
+	event, err = restarted.receive(request, now.Add(10*time.Minute))
 	if err != nil || event.Ready || event.Body != nil {
 		t.Fatal("restart bypassed fresh confirmation:", err)
 	}
@@ -394,11 +395,11 @@ func TestSecureExpiry(t *testing.T) {
 
 func TestSecurePendingResponseExpiry(t *testing.T) {
 	a, b, now := secureTestPair()
-	_, request, err := a.Start(b.public, now)
+	_, request, err := a.start(b.public, now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	event, err := b.Receive(request, now)
+	event, err := b.receive(request, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -462,11 +463,11 @@ func TestSecurePruneAbsoluteExpiry(t *testing.T) {
 			} else {
 				var request []byte
 				var err error
-				id, request, err = a.Start(b.public, now)
+				id, request, err = a.start(b.public, now)
 				if err != nil {
 					t.Fatal(err)
 				}
-				if _, err := b.Receive(request, now); err != nil {
+				if _, err := b.receive(request, now); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -490,35 +491,35 @@ func TestSecurePruneAbsoluteExpiry(t *testing.T) {
 func TestSecurePacketAndNonceBounds(t *testing.T) {
 	a, b, now := secureTestPair()
 	id, _, _ := secureTestOpen(t, a, b, now)
-	for _, body := range [][]byte{nil, {}, make([]byte, secureMaxSize-secureHeaderN-15)} {
-		if _, err := a.Seal(id, body, now); err == nil {
+	for _, body := range [][]byte{nil, {}, make([]byte, secureInnerMaxSize-secureHeaderN-15)} {
+		if _, err := a.seal(id, body, now); err == nil {
 			t.Fatal("invalid body length accepted")
 		}
 	}
 	if a.sessions[id].next != 0 {
 		t.Fatal("invalid body consumed send counter")
 	}
-	packet := secureTestSend(t, a, b, id, make([]byte, secureMaxSize-secureHeaderN-16), now)
-	if len(packet) != secureMaxSize {
+	packet := secureTestSend(t, a, b, id, make([]byte, secureInnerMaxSize-secureHeaderN-16), now)
+	if len(packet) != secureInnerMaxSize {
 		t.Fatal("maximum-size packet has wrong length")
 	}
 	secureTestReject(t, b, append(bytes.Clone(packet), 0), now)
 	h := secureHeader(secureData, a.public, b.public, id, 1)
 	secureTestReject(t, b, a.sessions[id].tx.Encrypt(h, 1, h, nil), now)
 	a.sessions[id].next = noise.MaxNonce - 1
-	penultimate, err := a.Seal(id, []byte("penultimate nonce"), now)
+	penultimate, err := a.seal(id, []byte("penultimate nonce"), now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	last, err := a.Seal(id, []byte("last nonce"), now)
+	last, err := a.seal(id, []byte("last nonce"), now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := a.Seal(id, []byte("overflow"), now); err == nil {
+	if _, err := a.seal(id, []byte("overflow"), now); err == nil {
 		t.Fatal("nonce overflow accepted")
 	}
 	for _, packet := range [][]byte{last, penultimate} {
-		if _, err := b.Receive(packet, now); err != nil {
+		if _, err := b.receive(packet, now); err != nil {
 			t.Fatal("valid final nonce rejected:", err)
 		}
 		secureTestReject(t, b, packet, now)
@@ -531,12 +532,12 @@ func TestSecurePacketAndNonceBounds(t *testing.T) {
 func TestSecureIDUniquenessAndEntropyFailure(t *testing.T) {
 	a, b, now := secureTestPair()
 	a.random = bytes.NewReader(bytes.Repeat([]byte{11}, 4096))
-	id, _, err := a.Start(b.public, now)
+	id, _, err := a.start(b.public, now)
 	if err != nil {
 		t.Fatal(err)
 	}
 	// Even repeated entropy and expiry cannot repeat a locally generated ID.
-	other, _, err := a.Start(b.public, now.Add(10*time.Second))
+	other, _, err := a.start(b.public, now.Add(10*time.Second))
 	if err != nil || other == id {
 		t.Fatal("expired local ID was reused:", err)
 	}
@@ -546,26 +547,26 @@ func TestSecureIDUniquenessAndEntropyFailure(t *testing.T) {
 	a.ids.Encrypt(collision[:], collision[:])
 	live := &secureSession{peer: b.public, expires: now.Add(time.Minute)}
 	a.sessions[collision] = live
-	if _, _, err := a.Start(b.public, now.Add(11*time.Second)); err == nil || a.sessions[collision] != live {
+	if _, _, err := a.start(b.public, now.Add(11*time.Second)); err == nil || a.sessions[collision] != live {
 		t.Fatal("generated duplicate ID replaced live state")
 	}
 	a.random = bytes.NewReader(nil)
-	failed, _, err := a.Start(b.public, now.Add(12*time.Second))
+	failed, _, err := a.start(b.public, now.Add(12*time.Second))
 	if err != io.EOF || a.sessions[failed] != nil {
 		t.Fatal("entropy failure created a session:", err)
 	}
 	a.random = bytes.NewReader(bytes.Repeat([]byte{11}, 32))
-	next, _, err := a.Start(b.public, now.Add(13*time.Second))
+	next, _, err := a.start(b.public, now.Add(13*time.Second))
 	if err != nil || next == failed || next == collision || next == id || next == other {
 		t.Fatal("failed or previous ID was reused:", err)
 	}
 	a.serial = ^uint64(0)
-	if _, _, err := a.Start(b.public, now.Add(14*time.Second)); err == nil {
+	if _, _, err := a.start(b.public, now.Add(14*time.Second)); err == nil {
 		t.Fatal("ID serial wrapped")
 	}
 	c := newSecure(a.private, []wgtypes.Key{b.public})
 	c.random = bytes.NewReader(nil)
-	if _, _, err := c.Start(b.public, now); err != io.EOF || len(c.sessions) != 0 {
+	if _, _, err := c.start(b.public, now); err != io.EOF || len(c.sessions) != 0 {
 		t.Fatal("ID-key entropy failure created a session:", err)
 	}
 }
@@ -582,11 +583,11 @@ func TestSecureSessionBounds(t *testing.T) {
 		}
 	}
 	at := now.Add(64 * time.Second)
-	if _, _, err := a.Start(b.public, at); err == nil || len(a.sessions) != 64 {
+	if _, _, err := a.start(b.public, at); err == nil || len(a.sessions) != 64 {
 		t.Fatal("per-peer Start bound failed")
 	}
 	fresh := newSecure(a.private, []wgtypes.Key{b.public})
-	_, request, err := fresh.Start(b.public, at)
+	_, request, err := fresh.start(b.public, at)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -614,15 +615,15 @@ func TestSecureSessionBounds(t *testing.T) {
 	}
 	c := newSecure(secureTestKey(200), peers)
 	for i := 0; i < 512; i++ {
-		if _, _, err := c.Start(peers[i/32], now); err != nil {
+		if _, _, err := c.start(peers[i/32], now); err != nil {
 			t.Fatal("global bound reached too early:", err)
 		}
 	}
-	if _, _, err := c.Start(peers[16], now); err == nil || len(c.sessions) != 512 {
+	if _, _, err := c.start(peers[16], now); err == nil || len(c.sessions) != 512 {
 		t.Fatal("global Start bound failed")
 	}
 	d := newSecure(secureTestKey(26), []wgtypes.Key{c.public})
-	_, request, err = d.Start(c.public, now)
+	_, request, err = d.start(c.public, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -630,7 +631,7 @@ func TestSecureSessionBounds(t *testing.T) {
 	if len(c.sessions) != 512 {
 		t.Fatal("global Receive bound evicted sessions")
 	}
-	if _, _, err := c.Start(peers[16], now.Add(10*time.Second)); err != nil || len(c.sessions) != 1 {
+	if _, _, err := c.start(peers[16], now.Add(10*time.Second)); err != nil || len(c.sessions) != 1 {
 		t.Fatal("expired capacity was not recovered:", err)
 	}
 }
@@ -638,7 +639,7 @@ func TestSecureSessionBounds(t *testing.T) {
 func TestSecureHandshakeRateLimits(t *testing.T) {
 	t.Run("configured key", func(t *testing.T) {
 		a, b, now := secureTestPair()
-		_, request, err := a.Start(b.public, now)
+		_, request, err := a.start(b.public, now)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -651,21 +652,21 @@ func TestSecureHandshakeRateLimits(t *testing.T) {
 		if len(b.sessions) != 0 || b.peers[a.public].used != 8 {
 			t.Fatal("per-key budget failed")
 		}
-		if _, err := b.Receive(request, now.Add(time.Second)); err != nil {
+		if _, err := b.receive(request, now.Add(time.Second)); err != nil {
 			t.Fatal("per-key budget did not recover:", err)
 		}
 	})
 	t.Run("unknown keys", func(t *testing.T) {
 		a, b, now := secureTestPair()
 		outsider := newSecure(secureTestKey(3), []wgtypes.Key{b.public})
-		_, unknown, err := outsider.Start(b.public, now)
+		_, unknown, err := outsider.start(b.public, now)
 		if err != nil {
 			t.Fatal(err)
 		}
 		for i := 0; i < 64; i++ {
 			secureTestReject(t, b, unknown, now)
 		}
-		_, request, err := a.Start(b.public, now)
+		_, request, err := a.start(b.public, now)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -673,7 +674,7 @@ func TestSecureHandshakeRateLimits(t *testing.T) {
 		if len(b.peers) != 1 || len(b.sessions) != 0 || b.global.used != 64 {
 			t.Fatal("unknown keys bypassed global budget or allocated state")
 		}
-		if _, err := b.Receive(request, now.Add(time.Second)); err != nil {
+		if _, err := b.receive(request, now.Add(time.Second)); err != nil {
 			t.Fatal("global budget did not recover:", err)
 		}
 	})
@@ -686,13 +687,13 @@ func TestSecureHandshakeRateLimits(t *testing.T) {
 		now := time.Unix(1000, 0)
 		for i := range peers {
 			a := newSecure(secureTestKey(byte(i+1)), []wgtypes.Key{b.public})
-			_, request, err := a.Start(b.public, now)
+			_, request, err := a.start(b.public, now)
 			if err != nil {
 				t.Fatal(err)
 			}
 			if i == 8 {
 				secureTestReject(t, b, request, now)
-				if _, err := b.Receive(request, now.Add(time.Second)); err != nil {
+				if _, err := b.receive(request, now.Add(time.Second)); err != nil {
 					t.Fatal(err)
 				}
 				break
@@ -708,7 +709,7 @@ func TestSecureHandshakeRateLimits(t *testing.T) {
 func TestSecureTruncatedPackets(t *testing.T) {
 	a, b, now := secureTestPair()
 	id, request, reply := secureTestOpen(t, a, b, now)
-	packet, err := a.Seal(id, []byte("truncation must not consume a counter"), now)
+	packet, err := a.seal(id, []byte("truncation must not consume a counter"), now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -718,7 +719,7 @@ func TestSecureTruncatedPackets(t *testing.T) {
 			secureTestReject(t, b, full[:n], now)
 		}
 	}
-	if _, err := b.Receive(packet, now); err != nil {
+	if _, err := b.receive(packet, now); err != nil {
 		t.Fatal("truncation spoiled valid packet:", err)
 	}
 	for _, kind := range []byte{0, 4, 255} {
@@ -728,10 +729,10 @@ func TestSecureTruncatedPackets(t *testing.T) {
 	}
 }
 
-func FuzzSecureReceive(f *testing.F) {
+func FuzzSecureInnerReceive(f *testing.F) {
 	a, b, now := secureTestPair()
 	id, request, reply := secureTestOpen(f, a, b, now)
-	packet, err := a.Seal(id, []byte("fuzz transport"), now)
+	packet, err := a.seal(id, []byte("fuzz transport"), now)
 	if err != nil {
 		f.Fatal(err)
 	}
@@ -740,23 +741,23 @@ func FuzzSecureReceive(f *testing.F) {
 			f.Add(bytes.Clone(full[:n]))
 		}
 	}
-	f.Add(make([]byte, secureMaxSize+1))
+	f.Add(make([]byte, secureInnerMaxSize+1))
 	f.Fuzz(func(t *testing.T, data []byte) {
 		a, b, now := secureTestPair()
 		secureTestOpen(t, a, b, now)
 		pending, _, _ := secureTestPair()
-		if _, _, err := pending.Start(b.public, now); err != nil {
+		if _, _, err := pending.start(b.public, now); err != nil {
 			t.Fatal(err)
 		}
 		for _, receiver := range []*secure{a, b, pending, newSecure(b.private, []wgtypes.Key{a.public})} {
-			event, err := receiver.Receive(data, now)
+			event, err := receiver.receive(data, now)
 			if err != nil {
 				if event.Peer != (wgtypes.Key{}) || event.ID != ([16]byte{}) || event.Ready || event.Body != nil || event.Reply != nil {
 					t.Fatal("error exposed an event")
 				}
 				continue
 			}
-			if len(data) < secureHeaderN || len(data) > secureMaxSize || receiver.peers[event.Peer] == nil || event.ID == ([16]byte{}) {
+			if len(data) < secureHeaderN || len(data) > secureInnerMaxSize || receiver.peers[event.Peer] == nil || event.ID == ([16]byte{}) {
 				t.Fatal("invalid successful fuzz event")
 			}
 			switch data[1] {
