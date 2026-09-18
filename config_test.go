@@ -19,7 +19,7 @@ func TestConfigDefaults(t *testing.T) {
 	want := config{
 		Address: netip.MustParseAddr("10.0.0.2"),
 		Peers:   []peerSpec{{PublicKey: key.String(), IP: netip.MustParseAddr("10.0.0.3"), PresharedKey: psk.String(), key: key, psk: psk}},
-		Port:    51821, Multicast4: netip.MustParseAddr("239.255.77.77"), Multicast6: netip.MustParseAddr("ff12::5747:4d53"),
+		Port:    51823, Multicast4: netip.MustParseAddr("239.255.77.77"), Multicast6: netip.MustParseAddr("ff12::5747:4d53"),
 		Discovery: duration(time.Minute), BroadcastAfter: duration(5 * time.Minute),
 		Probe: duration(time.Second), Window: duration(15 * time.Second), Failure: duration(5 * time.Second),
 		Cooldown: duration(30 * time.Second), MinGain: duration(2 * time.Millisecond), Gain: 0.2,

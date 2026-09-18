@@ -6,7 +6,7 @@
       "ip": "10.77.0.3"
     }
   ],
-  "port": 51821,
+  "port": 51823,
   "multicast4": "239.255.77.77",
   "multicast6": "ff12::5747:4d53",
   "discovery_interval": "1m",

@@ -50,7 +50,7 @@ type config struct {
 
 func defaults() config {
 	return config{
-		Port: 51821, Multicast4: netip.MustParseAddr("239.255.77.77"),
+		Port: 51823, Multicast4: netip.MustParseAddr("239.255.77.77"),
 		Multicast6: netip.MustParseAddr("ff12::5747:4d53"),
 		Discovery:  duration(time.Minute), BroadcastAfter: duration(5 * time.Minute),
 		Probe: duration(time.Second), Window: duration(15 * time.Second),

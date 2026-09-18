@@ -56,7 +56,7 @@ wireguard-meshd -wireguard wg0 -config /etc/wireguard-mesh/wg0.json
 
 `wg0` is the interface created by your existing WireGuard setup, not a path to a `.conf` file. The daemon does not execute `wg-quick`, create interfaces, or change persistent WireGuard configuration.
 
-The known default discovery address is **`239.255.77.77:51821`**. IPv6 discovery uses **`[ff12::5747:4d53]:51821`**. These are multicast destination addresses; do not assign them to an interface. This daemon port is separate from the WireGuard listen port. All participating nodes must use the same daemon port and compatible multicast groups.
+The known default discovery address is **`239.255.77.77:51823`**. IPv6 discovery uses **`[ff12::5747:4d53]:51823`**. These are multicast destination addresses; do not assign them to an interface. This daemon port is separate from the WireGuard listen port. All participating nodes must use the same daemon port and compatible multicast groups.
 
 Copy [example.json](example.json) and replace its public-key placeholder. For node B:
 
@@ -88,7 +88,7 @@ All JSON settings other than `address` and `peers` have defaults:
 
 | Setting | Default | Function |
 |---|---|---|
-| `port` | `51821` | Multicast, broadcast, and authenticated unicast UDP port |
+| `port` | `51823` | Multicast, broadcast, and authenticated unicast UDP port |
 | `multicast4` | `239.255.77.77` | IPv4 multicast group |
 | `multicast6` | `ff12::5747:4d53` | IPv6 link-local multicast group |
 | `include` | `[]` | Optional interface allowlist; permits explicit bridge, VLAN, bond, or test interfaces |

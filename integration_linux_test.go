@@ -149,7 +149,7 @@ func TestNetNSDirectFailover(t *testing.T) {
 	var services []*service
 	for i := 1; i <= 2; i++ {
 		config := filepath.Join(dirs[i], "config.json")
-		write(config, fmt.Sprintf(`{"address":%q,"port":51821,"include":["lan0"],
+		write(config, fmt.Sprintf(`{"address":%q,"port":51823,"include":["lan0"],
 			"peers":[{"public_key":%q,"ip":%q}],"discovery_interval":"1s",
 			"broadcast_after":"3s","probe_interval":"200ms","latency_window":"3s",
 			"failure_timeout":"1s","cooldown":"3s","minimum_gain":"2ms","minimum_gain_fraction":0.2}`,

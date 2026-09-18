@@ -10,7 +10,7 @@ This follows the hub example and the runtime configuration model in `README.md`.
 
 - Use Go and keep the service small. Use one package and one protocol event loop. Do not add a central discovery service, a metrics server, or a general routing framework.
 - Require an explicit WireGuard configuration/interface name with `-wireguard NAME`. Do not select a device automatically.
-- Use the known default discovery address `239.255.77.77:51821`. Keep the multicast groups and port configurable.
+- Use the known default discovery address `239.255.77.77:51823`. Keep the multicast groups and port configurable.
 - Provide a Nix development flake and isolated QEMU tests. Run builds and verification on an authorized Linux machine.
 - Local QEMU/KVM testing is now authorized. Four implemented scenarios have passed; see `tests/README.md`. The larger matrix below remains the target, not a claim that every case has run.
 - The first implementation supports one tunnel host address per peer and existing OS routes through the named Linux kernel WireGuard interface. Direct peers must not already exist in the stable WireGuard configuration. Their identities belong in the daemon's local peer list.
@@ -48,7 +48,7 @@ Proposed defaults:
 | Setting | Default |
 |---|---|
 | WireGuard interface | Explicit configuration, for example `wg0` |
-| Daemon UDP port | `51821`, proposed application default |
+| Daemon UDP port | `51823`, proposed application default |
 | IPv4 multicast group | `239.255.77.77`, configurable |
 | IPv6 multicast group | Configurable link-local multicast group |
 | Multicast TTL / hop limit | `1` |

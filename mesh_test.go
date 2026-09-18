@@ -390,7 +390,7 @@ func TestMeshLinkLocalNeverQualifies(t *testing.T) {
 	for _, tc := range []struct {
 		endpoint string
 		want     bool
-	}{{"192.0.2.3:51821", true}, {"[fd00::3]:51821", true}, {"[fe80::3]:51821", false}, {"[fe80::3%lan0]:51821", false}} {
+	}{{"192.0.2.3:51823", true}, {"[fd00::3]:51823", true}, {"[fe80::3]:51823", false}, {"[fe80::3%lan0]:51823", false}} {
 		candidate.addr = netip.MustParseAddrPort(tc.endpoint)
 		if _, ok := n.m.qualified(n.p, &candidate, s.now); ok != tc.want {
 			t.Errorf("qualification for %s = %v, want %v", tc.endpoint, ok, tc.want)
