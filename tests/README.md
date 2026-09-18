@@ -2,6 +2,28 @@
 
 These tests use the NixOS test driver, QEMU/KVM, real kernel WireGuard, and the repository's systemd service template. The mesh daemon runs as a dynamic user with `CAP_NET_ADMIN`, not as root. Rosenpass runs as a different user, without capabilities.
 
+## How QEMU Is Used
+
+These are full VM integration tests, not mocked network tests or containers. The NixOS test driver starts QEMU directly; it does not use libvirt.
+
+1. [The flake](../flake.nix) builds the Go daemon and exposes the four test outputs. [default.nix](default.nix) defines the guest systems with `pkgs.testers.runNixOSTest`. Its `qemu.forceAccel = true` setting requires KVM hardware acceleration.
+2. The driver starts three guests for the relay-only, shared-LAN, and Rosenpass cases: relay A and nodes B and C. The NAT case adds two router guests. Each guest has its own Linux kernel, interfaces, WireGuard state, and systemd services.
+3. The guests connect through isolated virtual Ethernet networks. The `vlan` numbers in the test configuration identify these test networks; they do not configure VLANs on the host's physical network. Initially, B and C have only A as their WireGuard peer. A forwards their tunnel traffic.
+4. [base.py](base.py) controls the guests through the Python test driver. Commands such as `b.succeed("ip link set lan down")` run inside guest B. [guest.py](guest.py) creates the real WireGuard interfaces, test keys, routes, and NAT rules. Setup commands run as root inside the guests; the mesh daemon runs through its non-root systemd service.
+5. The driver checks traffic and WireGuard state, introduces faults, and waits for the required recovery. Successful pings alone are not sufficient: direct operation also requires the correct peer, endpoint, handshake, and increased direct-peer byte counters. [rosenpass.py](rosenpass.py) runs actual Rosenpass processes and waits for a natural rekey rather than supplying a replacement key manually.
+6. A failed command or assertion fails the Nix test build. Successful outputs retain guest journals and network-state records. The driver stops the guests after the test.
+
+The shared-LAN case has this topology:
+
+```text
+             Simulated WAN
+           B ----- A ----- C
+           |     relay     |
+           +-- shared LAN--+
+```
+
+The test adds delay inside relay A so that the direct LAN route has a measurable advantage. It then removes the LAN connection or kills the daemon to check recovery through A. Host network interfaces, firewall rules, and WireGuard services are not changed.
+
 ## Run
 
 From the repository root on an authorized Linux x86-64 machine:
@@ -17,6 +39,13 @@ nix build --no-link --print-out-paths -L --max-jobs 1 \
 The builder needs access to `/dev/kvm` and Nix system features `kvm` and `nixos-test`. Hardware acceleration is required. Libvirt is not used. Allow approximately 4 GiB of guest memory for the largest test, plus host overhead. The first build must download the guest dependencies.
 
 Nix reuses successful results for unchanged inputs. To execute an unchanged check again, add `--rebuild` to its `nix build` command. Do not use `--rebuild` to compare logs byte for byte: runtime timestamps and generated test keys differ.
+
+For example, force a fresh QEMU run of the shared-LAN test:
+
+```sh
+nix build --rebuild --no-link -L \
+  path:.#checks.x86_64-linux.same-lan
+```
 
 ## Cases
 
