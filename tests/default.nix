@@ -15,6 +15,60 @@ let
     #!${pkgs.python3}/bin/python3
     ${builtins.readFile ./guest.py}
   '';
+  recoveryGuest = pkgs.writeScriptBin "mesh-recovery-test" ''
+    #!${pkgs.python3}/bin/python3
+    ${builtins.readFile ./recovery_guest.py}
+  '';
+  adapterGuest = pkgs.writeScriptBin "mesh-adapter-test" ''
+    #!${pkgs.python3}/bin/python3
+    ${builtins.readFile ./adapter_guest.py}
+  '';
+  adapterTemplate = pkgs.runCommand "wireguard-mesh-adapter-test-unit" { } ''
+    mkdir -p $out/lib/systemd/system
+    cp ${
+      pkgs.writeText "wireguard-mesh-rosenpass@.service" (
+        lib.replaceStrings
+          [ "wireguard-meshd -" "ExecStartPre=install " ]
+          [ "${mesh}/bin/wireguard-meshd -" "ExecStartPre=${pkgs.coreutils}/bin/install " ]
+          (builtins.readFile (../. + "/wireguard-mesh-rosenpass@.service"))
+      )
+    } $out/lib/systemd/system/wireguard-mesh-rosenpass@.service
+  '';
+  adapter = {
+    environment.systemPackages = [ pkgs.rosenpass ];
+    systemd.packages = [ adapterTemplate ];
+    users.groups.mesh-wg0 = { };
+    users.groups.mesh-psk-wg0 = { };
+    users.users.mesh-wg0 = {
+      isSystemUser = true;
+      uid = 991;
+      group = "mesh-wg0";
+      extraGroups = [ "mesh-psk-wg0" ];
+    };
+    users.users.mesh-rosenpass-wg0 = {
+      isSystemUser = true;
+      group = "mesh-psk-wg0";
+    };
+    # This account can open the socket but must fail its SO_PEERCRED check.
+    users.users.mesh-intruder = {
+      isSystemUser = true;
+      group = "mesh-psk-wg0";
+    };
+    systemd.services."wireguard-meshd@wg0".serviceConfig = {
+      DynamicUser = lib.mkForce false;
+      User = "mesh-wg0";
+      SupplementaryGroups = [ "mesh-psk-wg0" ];
+    };
+    # Keep mesh running when the adapter stops so its own fallback is tested.
+    # These cases test IPv4 endpoint changes, not IPv6 address selection.
+    boot.kernel.sysctl."net.ipv6.conf.all.disable_ipv6" = 1;
+    boot.kernel.sysctl."net.ipv6.conf.default.disable_ipv6" = 1;
+    boot.kernelModules = [
+      "sch_ingress"
+      "cls_u32"
+      "act_gact"
+    ];
+  };
   rosenpass = {
     environment.systemPackages = [ pkgs.rosenpass ];
     users.groups.mesh-psk = { };
@@ -63,6 +117,8 @@ let
         environment.systemPackages = with pkgs; [
           mesh
           guest
+          recoveryGuest
+          adapterGuest
           wireguard-tools
           iproute2
           iptables
@@ -87,7 +143,9 @@ let
           boot.kernel.sysctl."net.ipv4.ip_forward" = 1;
         };
         b = {
-          imports = lib.optional (mode == "rosenpass") rosenpass;
+          imports =
+            lib.optional (mode == "rosenpass") rosenpass
+            ++ lib.optional (lib.hasPrefix "rosenpass-" mode) adapter;
           virtualisation.interfaces =
             if mode == "nat" then
               { lan.vlan = 2; }
@@ -122,7 +180,9 @@ let
               };
         };
         c = {
-          imports = lib.optional (mode == "rosenpass") rosenpass;
+          imports =
+            lib.optional (mode == "rosenpass") rosenpass
+            ++ lib.optional (lib.hasPrefix "rosenpass-" mode) adapter;
           virtualisation.interfaces =
             if mode == "nat" then
               { lan.vlan = 3; }
@@ -204,8 +264,17 @@ let
       testScript = ''
         mode = "${mode}"
         ${builtins.readFile ./rosenpass.py}
+        ${builtins.readFile ./adapter.py}
+        ${builtins.readFile ./recovery.py}
         ${builtins.readFile ./base.py}
       '';
     };
 in
-lib.genAttrs [ "relay-only" "same-lan" "nat" "rosenpass" ] makeTest
+lib.genAttrs [
+  "relay-only"
+  "same-lan"
+  "nat"
+  "rosenpass"
+  "rosenpass-adapter"
+  "rosenpass-rekey"
+] makeTest

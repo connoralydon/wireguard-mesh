@@ -95,7 +95,7 @@ The adapter consumes Rosenpass's exact `exchanged` and `stale` stdout records. A
 After an exchanged event, the adapter validates the raw file and publishes a complete PSK through atomic rename. A separate socket response supplies the process instance, process counter, key counter, hash, and expiry. The mesh daemon reads status before and after the file. Both records must match the file hash and remain valid.
 
 - An unchanged, valid PSK is reused without a peer update or child restart.
-- A daemon restart can reuse a valid key from an adapter that is still running, after normal journal recovery and discovery.
+- A prompt daemon restart can reuse a valid key from an adapter that is still running, after normal journal recovery and discovery. A longer stop can expire the remote LAN health check and withdraw that endpoint.
 - An adapter restart invalidates old output. An old file alone cannot establish a valid exchange.
 - A stale event invalidates output and stops that child generation. The next endpoint report starts a fresh child.
 - Child exit, endpoint change, lost stdout, and expiry also invalidate output.
@@ -142,4 +142,8 @@ WGMESH_REKEY_TEST=1 go test -run '^TestLinuxPSKRekey$' -count=1 -v -timeout=6m
 
 It creates and removes isolated network namespaces. It demonstrates working old transport after a PSK mismatch and a post-update timestamp from an old pending key. A separate case blocks handshakes until old transport keys expire, then observes a fresh handshake with matching new PSKs. That controlled experiment preserves endpoints and AllowedIPs. Its timing assumptions are not a production verification guarantee.
 
-The existing Rosenpass QEMU test covers the older file-only mode through the relay. It does not test this LAN adapter or prove the experimental in-place path safe.
+The QEMU suite has separate `rosenpass`, `rosenpass-adapter`, and `rosenpass-rekey` checks. The first covers file-only mode through the relay. The adapter check covers LAN discovery before a key exists, socket restrictions, natural rekey without child restart, PSK reuse, endpoint changes, process failure, and expiry despite fresh file timestamps. The rekey check covers PSK-only peer preservation and bounded fallback when new handshakes are blocked but old direct transport still works. Independent hub PSKs must remain unchanged. See [tests/README.md](tests/README.md) for commands.
+
+The `same-lan` check also recreates the WireGuard interface while an active journal remains. Correct baseline recovery retains an empty journal file. Conflicting ownership leaves the original journal unchanged and stops recovery.
+
+These tests do not prove the experimental in-place path safe. They do not remove the handshake-generation limit described above.

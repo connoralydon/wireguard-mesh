@@ -2,7 +2,7 @@
 
 `wireguard-meshd` is a small Linux Go service for direct LAN paths between trusted WireGuard nodes. See [PLAN.md](PLAN.md) for the design.
 
-**Status:** the Go checks and four QEMU/KVM integration tests have passed on Linux x86-64. The VM tests cover relay-only operation, direct LAN operation and recovery, separate NAT networks, and Rosenpass exchange and rekey. See [tests/README.md](tests/README.md) for commands and limits. An independent security review is still required before production use.
+**Status:** the Go checks and six QEMU/KVM integration tests have passed on Linux x86-64. The VM tests cover relay-only operation, direct LAN operation, interface-loss recovery, separate NAT networks, Rosenpass file output, the LAN adapter, and experimental rekey. Passing tests do not prove which PSK established a WireGuard handshake. See [tests/README.md](tests/README.md) for commands and limits. An independent security review is still required before production use.
 
 Wireguard is an incredible VPN. One issue is that peers and routes are statically defined.
 
@@ -156,7 +156,7 @@ IPv6 link-local discovery is available, but link-local **WireGuard endpoints** a
 
 ## Build And Test
 
-Run these commands on an authorized Linux test machine. The flake pins nixpkgs and includes a daemon package, a development shell, and four isolated QEMU tests. `flake.lock` and the Go vendor hash are verified build inputs.
+Run these commands on an authorized Linux test machine. The flake pins nixpkgs and includes a daemon package, a development shell, and six isolated QEMU tests. `flake.lock` and the Go vendor hash are verified build inputs.
 
 Build the daemon:
 
@@ -171,7 +171,9 @@ nix build --no-link --print-out-paths -L --max-jobs 1 \
   path:.#checks.x86_64-linux.relay-only \
   path:.#checks.x86_64-linux.same-lan \
   path:.#checks.x86_64-linux.nat \
-  path:.#checks.x86_64-linux.rosenpass
+  path:.#checks.x86_64-linux.rosenpass \
+  path:.#checks.x86_64-linux.rosenpass-adapter \
+  path:.#checks.x86_64-linux.rosenpass-rekey
 ```
 
 The NixOS test driver starts QEMU directly. Libvirt is not required. The builder needs access to `/dev/kvm` and the Nix system features `kvm` and `nixos-test`. It creates isolated virtual Ethernet networks; it does not change host network interfaces, firewall rules, or WireGuard services. Each successful output contains guest journals and key-free network state. See [the test guide](tests/README.md) for details.

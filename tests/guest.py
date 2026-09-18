@@ -75,9 +75,23 @@ if command == "setup":
         if mode == "rosenpass":
             config["peers"][0]["preshared_key_file"] = "/run/rosenpass/peer.psk"
             # Leave max age unset to exercise the three-minute default.
+        elif mode.startswith("rosenpass-"):
+            config["failure_timeout"] = "5s"
+            config["peers"][0].update({
+                "preshared_key_file": "/run/wireguard-mesh-rosenpass-wg0/peer.psk",
+                "rosenpass_socket": "/run/wireguard-mesh-rosenpass-wg0/adapter.sock",
+                "experimental_in_place_rekey": mode == "rosenpass-rekey",
+            })
         directory = pathlib.Path("/etc/wireguard-mesh")
         directory.mkdir(exist_ok=True)
         (directory / "wg0.json").write_text(json.dumps(config))
+    if mode.startswith("rosenpass-"):
+        # Independent, NON-PRODUCTION hub PSKs must survive every mesh change.
+        for peer in (["b", "c"] if name == "a" else [name]):
+            keyfile.write_text(base64.b64encode(hashlib.sha256(f"wgmesh-QEMU-TEST-ONLY-hub-{peer}".encode()).digest()).decode())
+            keyfile.chmod(0o600)
+            run("wg", "set", "wg0", "peer", keys(peer if name == "a" else "a")[1], "preshared-key", str(keyfile))
+            keyfile.unlink()
 elif command == "state":
     print(json.dumps(state()))
 elif command == "public":
@@ -139,6 +153,7 @@ elif command == "capture":
         "service": ["systemctl", "show", "wireguard-meshd@wg0", "-p", "ActiveState,SubState,Result,ExecMainStatus,DynamicUser,User,MainPID,CapabilityBoundingSet,AmbientCapabilities,NoNewPrivileges"],
         "nat": ["iptables-save", "-c"],
         "rosenpass-journal": ["journalctl", "-b", "-u", "rosenpass", "--no-pager"],
+        "adapter-journal": ["journalctl", "-b", "-u", "wireguard-mesh-rosenpass@wg0", "--no-pager"],
     }
     for label, args in commands.items():
         output = subprocess.run(args, text=True, capture_output=True)

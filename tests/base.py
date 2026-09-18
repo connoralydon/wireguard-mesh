@@ -3,6 +3,7 @@ import time
 
 unit = "wireguard-meshd@wg0.service"
 participants = machines
+lan_subnet = "172.20.2"
 
 
 def state(machine):
@@ -35,7 +36,7 @@ def direct():
         n = 3 if remote == "c" else 2
         current = state(machine)
         assert current["allowed-ips"] == {public["a"]: "10.77.0.0/24", public[remote]: f"10.77.0.{n}/32"}
-        assert current["endpoints"][public[remote]] == f"172.20.2.{n}:51820"
+        assert current["endpoints"][public[remote]] == f"{lan_subnet}.{n}:51820"
         handshake = int(current["latest-handshakes"][public[remote]])
         assert handshake > 0
         now = int(machine.succeed("date +%s"))
@@ -85,11 +86,14 @@ try:
         for machine in [b, c]:
             machine.succeed(f"systemctl start {unit}")
             machine.wait_for_unit(unit)
-            machine.succeed(f"test $(systemctl show {unit} -p DynamicUser --value) = yes")
+            dynamic = "no" if mode.startswith("rosenpass-") else "yes"
+            machine.succeed(f"test $(systemctl show {unit} -p DynamicUser --value) = {dynamic}")
             machine.succeed(f"test $(systemctl show {unit} -p NoNewPrivileges --value) = yes")
             machine.succeed(f"test $(ps -o uid= -p $(systemctl show {unit} -p MainPID --value)) -ne 0")
 
-    if mode == "rosenpass":
+    if mode.startswith("rosenpass-"):
+        adapter_test()
+    elif mode == "rosenpass":
         rosenpass_test()
     elif mode != "same-lan":
         with subtest("no direct LAN, no hole punching, relay retained"):
@@ -136,6 +140,8 @@ try:
             b.wait_for_unit(unit, timeout=40)
             wait_direct(before)
             direct_traffic()
+
+        interface_recovery_test()
 
     with subtest("service stop restores relay"):
         for machine in [b, c]:
