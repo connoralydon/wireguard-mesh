@@ -34,6 +34,7 @@ type meshNode struct {
 	lan                    linkAddr
 	segment                int
 	up, dropLAN, applied   bool
+	appliedPSK             wgtypes.Key
 	applies, restores      int
 	multicasts, broadcasts int
 }
@@ -76,8 +77,12 @@ func (n *meshNode) Apply(key wgtypes.Key, ip netip.Addr, psk wgtypes.Key, endpoi
 	if key != n.other.m.public || ip != n.other.m.c.Address || psk != n.p.spec.psk || endpoint != netip.AddrPortFrom(n.other.lan.Prefix.Addr(), n.other.m.wgPort) {
 		n.s.t.Fatal("incorrect direct route arguments")
 	}
+	if n.p.spec.PresharedKeyFile != "" && psk == (wgtypes.Key{}) {
+		n.s.t.Fatal("file-backed peer was installed without a PSK")
+	}
 	n.applies++
 	n.applied = true
+	n.appliedPSK = psk
 	return nil
 }
 
@@ -104,7 +109,7 @@ func (n *meshNode) Send(data []byte, dst netip.AddrPort, link linkAddr) error {
 		index, delay = other.m.tunnel.Index, 50*time.Millisecond
 		if n.applied || other.applied {
 			// Asymmetric route changes drop packets, rather than inventing a fast path.
-			if !n.applied || !other.applied || s.blockedWG || !lanOK {
+			if !n.applied || !other.applied || n.appliedPSK != other.appliedPSK || s.blockedWG || !lanOK {
 				return nil
 			}
 			delay = time.Millisecond

@@ -11,11 +11,11 @@ This follows the hub example and the runtime configuration model in `README.md`.
 - Use Go and keep the service small. Use one package and one protocol event loop. Do not add a central discovery service, a metrics server, or a general routing framework.
 - Require an explicit WireGuard configuration/interface name with `-wireguard NAME`. Do not select a device automatically.
 - Use the known default discovery address `239.255.77.77:51821`. Keep the multicast groups and port configurable.
-- Provide a Nix development flake. Run builds and verification only on a separately approved Linux machine.
-- Do not run any further tests or builds on the development device. Do not run QEMU there. The QEMU scenarios below remain future external tests, not executed checks.
+- Provide a Nix development flake and isolated QEMU tests. Run builds and verification on an authorized Linux machine.
+- Local QEMU/KVM testing is now authorized. Four implemented scenarios have passed; see `tests/README.md`. The larger matrix below remains the target, not a claim that every case has run.
 - The first implementation supports one tunnel host address per peer and existing OS routes through the named Linux kernel WireGuard interface. Direct peers must not already exist in the stable WireGuard configuration. Their identities belong in the daemon's local peer list.
 - Do not install IPv6 link-local WireGuard endpoints while the pinned control library omits their scope IDs. IPv4 and global/ULA IPv6 endpoints remain candidates. Link-local multicast discovery remains enabled.
-- Unit tests, protocol simulations, UDP tests, fuzz tests, race tests, and opt-in Linux network-namespace tests supplement future QEMU tests. Do not claim these tests passed without executing them on an approved machine.
+- Unit tests, protocol simulations, UDP tests, fuzz tests, race tests, and opt-in Linux network-namespace tests supplement QEMU tests. Do not claim a test passed without executing it on an authorized machine.
 
 ## Important Constraints
 
@@ -268,6 +268,8 @@ Acceptance tests should cover multicast success, blocked multicast, different st
 Use real kernel WireGuard and controlled delay/loss in integration tests. Unit-test timers and route decisions with a fake clock.
 
 ## QEMU Tests
+
+The implemented `relay-only`, `same-lan`, `nat`, and `rosenpass` checks have passed on Linux x86-64 with KVM. They include a real Rosenpass exchange and natural rekey. See [tests/README.md](tests/README.md) for the executed scope and remaining coverage.
 
 Use QEMU in addition to network-namespace tests. Run real kernel WireGuard and the packaged systemd service inside Linux guests. Test the service with its documented user and capabilities.
 

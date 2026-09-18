@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/netip"
+	"path/filepath"
 	"time"
 
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
@@ -21,10 +22,12 @@ func (d *duration) UnmarshalText(text []byte) error {
 }
 
 type peerSpec struct {
-	PublicKey    string     `json:"public_key"`
-	IP           netip.Addr `json:"ip"`
-	PresharedKey string     `json:"preshared_key,omitempty"`
-	key, psk     wgtypes.Key
+	PublicKey          string     `json:"public_key"`
+	IP                 netip.Addr `json:"ip"`
+	PresharedKey       string     `json:"preshared_key,omitempty"`
+	PresharedKeyFile   string     `json:"preshared_key_file,omitempty"`
+	PresharedKeyMaxAge *duration  `json:"preshared_key_max_age,omitempty"`
+	key, psk           wgtypes.Key
 }
 
 type config struct {
@@ -90,6 +93,19 @@ func readConfig(r io.Reader) (config, error) {
 		p.key, err = wgtypes.ParseKey(p.PublicKey)
 		if err != nil || p.key == (wgtypes.Key{}) || keys[p.key] || ips[p.IP] || !overlayAddress(p.IP) || p.IP.Is4() != c.Address.Is4() {
 			return c, fmt.Errorf("peer %d: invalid or duplicate key/address, or tunnel address family mismatch", i)
+		}
+		if p.PresharedKeyFile != "" {
+			if !filepath.IsAbs(p.PresharedKeyFile) || p.PresharedKey != "" {
+				return c, fmt.Errorf("peer %d: preshared_key_file must be absolute and excludes preshared_key", i)
+			}
+			if p.PresharedKeyMaxAge == nil {
+				p.PresharedKeyMaxAge = new(duration(3 * time.Minute))
+			}
+		} else if p.PresharedKeyMaxAge != nil {
+			return c, fmt.Errorf("peer %d: preshared_key_max_age requires preshared_key_file", i)
+		}
+		if p.PresharedKeyMaxAge != nil && (*p.PresharedKeyMaxAge < duration(130*time.Second) || *p.PresharedKeyMaxAge > duration(3*time.Minute)) {
+			return c, fmt.Errorf("peer %d: preshared_key_max_age must be between 130s and 3m", i)
 		}
 		if p.PresharedKey != "" {
 			p.psk, err = wgtypes.ParseKey(p.PresharedKey)

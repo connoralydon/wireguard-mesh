@@ -96,6 +96,8 @@ type probe struct {
 }
 type meshPeer struct {
 	spec                             peerSpec
+	pskValid                         bool
+	pskLogAfter                      time.Time
 	paths                            map[string]*path
 	discovery                        map[linkAddr]*discovery
 	pending                          map[string]probe
@@ -397,6 +399,10 @@ func (m *mesh) tick(now time.Time) error {
 	}
 	m.crypto.Prune(used, now)
 	for _, p := range m.peers {
+		pskOK, err := m.pollPSK(p, now)
+		if err != nil {
+			return err
+		}
 		for token, q := range p.pending {
 			if now.Sub(q.at) > time.Duration(m.c.Failure) {
 				delete(p.pending, token)
@@ -464,7 +470,7 @@ func (m *mesh) tick(now time.Time) error {
 				continue
 			}
 		}
-		if now.Before(p.cooldown) || bytes.Compare(m.public[:], p.spec.key[:]) >= 0 {
+		if !pskOK || now.Before(p.cooldown) || bytes.Compare(m.public[:], p.spec.key[:]) >= 0 {
 			continue
 		}
 		var best *path
@@ -504,6 +510,11 @@ func (m *mesh) command(p *meshPeer, op string, now time.Time) {
 func (m *mesh) coordinate(p *meshPeer, c *path, msg message, now time.Time) error {
 	if m.dry {
 		return nil
+	}
+	if msg.Op == "prepare" || msg.Op == "ready" || msg.Op == "commit" {
+		if ok, err := m.pollPSK(p, now); err != nil || !ok {
+			return err
+		}
 	}
 	if msg.Op == "prepare" && (p.phase == "" || p.phase == "active" && p.selected != c) && !now.Before(p.cooldown) && bytes.Compare(p.spec.key[:], m.public[:]) < 0 {
 		if base, ok := m.qualified(p, c, now); ok {
@@ -552,11 +563,19 @@ func (m *mesh) coordinate(p *meshPeer, c *path, msg message, now time.Time) erro
 }
 
 func (m *mesh) apply(p *meshPeer, now time.Time) error {
-	c := p.selected
+	started := time.Now()
 	if m.verify != nil {
 		if err := m.verify(); err != nil {
 			return err
 		}
+	}
+	// Include preflight time in the expiry check; never apply a cached file key.
+	if ok, err := m.pollPSK(p, now.Add(time.Since(started))); err != nil || !ok {
+		return err
+	}
+	c := p.selected
+	if c == nil {
+		return nil // A key change cancelled this coordination round.
 	}
 	if err := m.control.Apply(p.spec.key, p.spec.IP, p.spec.psk, netip.AddrPortFrom(c.addr.Addr(), c.port)); err != nil {
 		m.command(p, "abort", now)

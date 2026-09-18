@@ -93,3 +93,35 @@ func TestConfigMaximumWindow(t *testing.T) {
 		t.Fatal("maximum supported measurement window was not accepted:", err)
 	}
 }
+
+func TestConfigPSKFile(t *testing.T) {
+	for _, tc := range []struct {
+		fields string
+		age    time.Duration
+	}{
+		{`"preshared_key_file":"/run/rosenpass/peer.key"`, 3 * time.Minute},
+		{`"preshared_key_file":"/run/rosenpass/peer.key","preshared_key_max_age":"130s"`, 130 * time.Second},
+		{`"preshared_key_file":"/run/rosenpass/peer.key","preshared_key_max_age":"150s"`, 150 * time.Second},
+		{`"preshared_key_file":"/run/rosenpass/peer.key","preshared_key_max_age":"3m"`, 3 * time.Minute},
+		{`"preshared_key_file":"relative.key"`, 0},
+		{`"preshared_key_file":"/run/rosenpass/peer.key","preshared_key":"SECRET"`, 0},
+		{`"preshared_key_file":"/run/rosenpass/peer.key","preshared_key_max_age":"0s"`, 0},
+		{`"preshared_key_file":"/run/rosenpass/peer.key","preshared_key_max_age":"-1s"`, 0},
+		{`"preshared_key_file":"/run/rosenpass/peer.key","preshared_key_max_age":"129s"`, 0},
+		{`"preshared_key_file":"/run/rosenpass/peer.key","preshared_key_max_age":"181s"`, 0},
+		{`"preshared_key_file":"/run/rosenpass/peer.key","preshared_key_max_age":"SECRET"`, 0},
+		{`"preshared_key_max_age":"3m"`, 0},
+	} {
+		t.Run(tc.fields, func(t *testing.T) {
+			text := fmt.Sprintf(`{"address":"10.0.0.2","peers":[{"public_key":%q,"ip":"10.0.0.3",%s}]}`, controlTestKey(7).PublicKey().String(), tc.fields)
+			c, err := readConfig(strings.NewReader(text))
+			if tc.age == 0 {
+				if err == nil || strings.Contains(err.Error(), "SECRET") {
+					t.Fatal("invalid file configuration accepted or secret included in error")
+				}
+			} else if err != nil || c.Peers[0].PresharedKeyMaxAge == nil || time.Duration(*c.Peers[0].PresharedKeyMaxAge) != tc.age || c.Peers[0].psk != controlTestKey(0) {
+				t.Fatal("file configuration was not accepted without reading the runtime file:", err)
+			}
+		})
+	}
+}
