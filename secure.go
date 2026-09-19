@@ -30,6 +30,8 @@ const (
 	secureData           = 3
 )
 
+const secureSessionLifetime = 10 * time.Minute
+
 var errSecure = errors.New("secure: invalid, expired, replayed, or limited packet/session")
 
 // secure belongs to one event loop. Addresses and fresh ping/pong checks belong
@@ -403,7 +405,7 @@ func (s *secure) receive(data []byte, now time.Time) (secureEvent, error) {
 		event.Body = body
 	}
 	if !session.ready {
-		session.ready, session.expires = true, now.Add(10*time.Minute)
+		session.ready, session.expires = true, now.Add(secureSessionLifetime)
 	}
 	event.Ready = true
 	return event, nil

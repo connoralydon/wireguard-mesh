@@ -98,6 +98,7 @@ func checkPSKProof(key wgtypes.Key, msg message, sender, receiver wgtypes.Key) b
 // needs this address to obtain the first key. Retain a healthy endpoint to avoid
 // restarting exchanges merely because map iteration or RTT measurements change.
 func (m *mesh) readPeerPSK(p *meshPeer, now time.Time) (wgtypes.Key, rosenpassResponse, error) {
+	started := time.Now()
 	if p.spec.RosenpassSocket == "" {
 		key, err := readPSKFile(p.spec, now)
 		return key, rosenpassResponse{}, err
@@ -136,25 +137,27 @@ func (m *mesh) readPeerPSK(p *meshPeer, now time.Time) (wgtypes.Key, rosenpassRe
 		}
 	}
 	before, err := m.rosenpass(p.spec.RosenpassSocket, request)
-	if err != nil || !before.Valid || !now.Before(before.Expires) {
+	if err != nil || !before.Valid || !now.Add(time.Since(started)).Before(before.Expires) {
 		return wgtypes.Key{}, rosenpassResponse{}, errPSKFile
 	}
-	key, err := readPSKFile(p.spec, now)
+	key, err := readPSKFile(p.spec, now.Add(time.Since(started)))
 	if err != nil || sha256.Sum256(key[:]) != before.Hash {
 		return wgtypes.Key{}, rosenpassResponse{}, errPSKFile
 	}
 	after, err := m.rosenpass(p.spec.RosenpassSocket, request)
-	if err != nil || !after.Valid || before != after {
+	if err != nil || !after.Valid || before != after || !now.Add(time.Since(started)).Before(after.Expires) {
 		return wgtypes.Key{}, rosenpassResponse{}, errPSKFile
 	}
 	return key, after, nil
 }
 
 func (m *mesh) pollPSK(p *meshPeer, now time.Time) (bool, error) {
+	started := time.Now()
 	if p.spec.PresharedKeyFile == "" {
 		return true, nil
 	}
 	key, status, err := m.readPeerPSK(p, now)
+	now = now.Add(time.Since(started))
 	valid := err == nil
 	if !valid && !now.Before(p.pskLogAfter) {
 		slog.Warn("direct path disabled: PSK file unavailable", "peer", p.spec.IP)
@@ -165,8 +168,13 @@ func (m *mesh) pollPSK(p *meshPeer, now time.Time) (bool, error) {
 		p.pskStatus = status
 		return true, nil
 	}
+	if p.previous != nil {
+		m.retire(p, p.previous.trial, now)
+		p.previous = nil // A fallback must not cross a key transition.
+	}
 	if valid && !restarted && p.pskValid && p.phase == "active" && p.spec.ExperimentalRekey && p.remoteRekey {
 		if p.rekey == nil {
+			m.cancelReplacement(p, now)
 			phase := "waiting"
 			if bytes.Compare(m.public[:], p.spec.key[:]) < 0 {
 				phase = "offer"
