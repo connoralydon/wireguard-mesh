@@ -217,7 +217,7 @@ def adapter_rekey_test():
         for machine, remote, count in [(b, "c", observed[0]), (c, "b", observed[1])]:
             machine.wait_until_succeeds(f"mesh-adapter-test check {remote}", timeout=10)
             machine.wait_until_succeeds(
-                f"test $(journalctl -b -u {unit} --no-pager | grep -c 'experimental PSK update observed at both peers') -gt {count}", timeout=95
+                f"test $(journalctl -b -u {unit} --no-pager | grep -c 'experimental PSK update observed at both peers') -gt {count}", timeout=155
             )
         assert active_counts() == before
         assert adapter_log_counts("stable path restored") == restores
@@ -243,13 +243,17 @@ def adapter_rekey_test():
                 f"test $(journalctl -b -u {unit} --no-pager | grep -c 'experimental PSK-only update applied') -gt {count}", timeout=10
             )
             machine.succeed(f"mesh-adapter-test check {remote}")
+        # Hold this Rosenpass generation so another key change cannot mask the
+        # handshake-observation deadline. Live exchange status still expires.
+        for machine in [b, c]:
+            machine.succeed("mesh-adapter-test block on")
         # Old direct transport still works, but it is not new-key evidence.
         direct_traffic()
         for machine, remote, old in zip([b, c], ["c", "b"], handshakes):
             assert state(machine)["latest-handshakes"][public[remote]] == old[public[remote]]
         assert adapter_log_counts("experimental PSK update observed at both peers") == observed
         for machine in [b, c]:
-            machine.wait_until_succeeds("test $(wg show wg0 peers | wc -l) -eq 1", timeout=100)
+            machine.wait_until_succeeds("test $(wg show wg0 peers | wc -l) -eq 1", timeout=160)
         relay()
         ping()
         assert adapter_log_counts("experimental PSK update observed at both peers") == observed

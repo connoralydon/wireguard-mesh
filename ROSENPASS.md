@@ -113,9 +113,9 @@ The default policy restores the hub and repeats the direct trial when the key ch
 
 Both nodes must advertise support and confirm the new key before either updates WireGuard. The controller journals the old and new hashes before the update. It reads back the installed peer and hash before completing the local transaction. Recovery accepts only the expected hashes, not an unrelated key. A successful PSK-only update retains the peer, endpoint, and AllowedIPs.
 
-Coordination uses `failure_timeout`. The experimental handshake-observation phase has a 90-second limit. Missing key confirmation, failed updates, lost health, invalid output, or observation timeout restores the hub. A completed transaction can answer lost-message retries. A file change during an unfinished update also restores the hub.
+Coordination uses `failure_timeout`. The experimental handshake-observation phase has a 150-second limit to allow WireGuard's automatic handshake timer. The PSK update does not force a handshake. Missing key confirmation, failed updates, lost health, invalid output, or observation timeout restores the hub. A completed transaction can answer lost-message retries. A file change during an unfinished update also restores the hub.
 
-New performance-driven path changes wait for 90 seconds after local completion so that retries use the same path. Health failures still cause immediate fallback under the normal timeout rules.
+New performance-driven path changes wait for 150 seconds after local completion so that retries use the same path. Completion replies use the same limit. Health failures still cause immediate fallback under the normal timeout rules.
 
 **This is not verified new-PSK handshake protection.** Existing WireGuard transport keys survive a PSK update. An old pending session can also produce a newer `LastHandshakeTime`. The experimental path requires later handshake observations at both nodes, not traffic alone. Its logs explicitly state that the PSK generation remains unverified. The current WireGuard API exposes no handshake-to-PSK generation identifier. Do not enable this experiment in production. Zero packet loss is not promised.
 

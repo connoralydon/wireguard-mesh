@@ -201,6 +201,10 @@ type rekeyControl interface {
 	Handshake(key wgtypes.Key) (time.Time, error)
 }
 
+// A PSK-only update does not force WireGuard's automatic handshake. Allow its
+// two-minute rekey timer plus margin, while retaining health and key-age checks.
+const rekeyObservationTimeout = 150 * time.Second
+
 type pskTransition struct {
 	key                                     wgtypes.Key
 	phase, token                            string
@@ -226,7 +230,7 @@ func (m *mesh) coordinateRekey(p *meshPeer, c *path, msg message, now time.Time)
 	r := p.rekey
 	if r == nil && p.completedRekey != nil {
 		done := p.completedRekey
-		if now.Sub(done.finishedAt) < 90*time.Second && msg.Op == "rekey-observed" && msg.Token == done.token && checkPSKProof(done.key, msg, p.spec.key, m.public) {
+		if now.Sub(done.finishedAt) < rekeyObservationTimeout && msg.Op == "rekey-observed" && msg.Token == done.token && checkPSKProof(done.key, msg, p.spec.key, m.public) {
 			m.rekeyCommand(p, done, "rekey-finished", now)
 		}
 		return nil
@@ -319,7 +323,7 @@ func (m *mesh) advanceRekey(p *meshPeer, now time.Time) error {
 		}
 		return nil
 	}
-	if now.Sub(r.appliedAt) >= 90*time.Second || now.Sub(p.lastTunnel) >= time.Duration(m.c.Failure) {
+	if now.Sub(r.appliedAt) >= rekeyObservationTimeout || now.Sub(p.lastTunnel) >= time.Duration(m.c.Failure) {
 		return m.restore(p, now, "PSK handshake observation timeout")
 	}
 	if !r.remoteApplied && bytes.Compare(m.public[:], p.spec.key[:]) < 0 {
@@ -338,7 +342,7 @@ func (m *mesh) advanceRekey(p *meshPeer, now time.Time) error {
 			p.rekey = nil
 			r.finishedAt, p.completedRekey = now, r
 			// Completion retries use this same path until the remote deadline.
-			if until := now.Add(90 * time.Second); until.After(p.cooldown) {
+			if until := now.Add(rekeyObservationTimeout); until.After(p.cooldown) {
 				p.cooldown = until
 			}
 			p.remoteAt = now

@@ -2,7 +2,7 @@
 
 `wireguard-meshd` is a small Linux Go service for direct LAN paths between trusted WireGuard nodes. See [PLAN.md](PLAN.md) for the design.
 
-**Status:** Go and QEMU/KVM tests cover relay and LAN operation, recovery, separate NAT networks, Rosenpass, and IPv6 UDP transport. During performance validation, the experimental rekey completion check timed out on both the unchanged baseline and the optimized binary. Both restored the relay path. In-place rekey is not production-ready; a handshake timestamp does not prove which PSK established it. See [tests/README.md](tests/README.md) for commands and limits. An independent security review is still required before production use.
+**Status:** Go and QEMU/KVM tests cover relay and LAN operation, recovery, separate NAT networks, Rosenpass, and IPv6 UDP transport. The experimental rekey completion check failed with both the original 90-second observation limit and the current 150-second limit. With 150 seconds, another Rosenpass key arrived before observation completed, and the daemons restored the relay path. In-place rekey is not production-ready; a handshake timestamp does not prove which PSK established it. See [tests/README.md](tests/README.md) for commands and limits. An independent security review is still required before production use.
 
 Wireguard is an incredible VPN. One issue is that peers and routes are statically defined.
 

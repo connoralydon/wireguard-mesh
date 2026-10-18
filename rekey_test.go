@@ -98,8 +98,35 @@ func TestMeshExperimentalRekey(t *testing.T) {
 	}
 }
 
+func TestMeshExperimentalRekeyDelayedHandshake(t *testing.T) {
+	for _, delay := range []time.Duration{95 * time.Second, 120 * time.Second} {
+		t.Run(delay.String(), func(t *testing.T) {
+			s, controls := rekeySimulation(t)
+			var paths [2]*path
+			for i, n := range s.nodes {
+				paths[i] = n.p.selected
+				writeTestPSK(t, n.p.spec.PresharedKeyFile, controlTestKey(44).String(), s.now)
+			}
+			s.run(3 * time.Second)
+			s.run(delay)
+			for _, f := range controls {
+				if f.p.rekey == nil || f.restores != 0 || f.rekeys != 1 {
+					t.Fatal("healthy transport was restored before the automatic handshake")
+				}
+				f.handshake = s.now
+			}
+			s.run(4 * time.Second)
+			for i, f := range controls {
+				if f.p.rekey != nil || f.p.selected != paths[i] || f.applies != 1 || f.restores != 0 {
+					t.Fatal("delayed handshake did not complete on the existing direct path")
+				}
+			}
+		})
+	}
+}
+
 func TestMeshExperimentalRekeyFallback(t *testing.T) {
-	for _, failure := range []string{"mismatch", "one file", "no handshake", "one handshake", "apply error"} {
+	for _, failure := range []string{"mismatch", "one file", "no handshake", "one handshake", "future handshake", "tunnel loss", "next key", "apply error"} {
 		t.Run(failure, func(t *testing.T) {
 			s, controls := rekeySimulation(t)
 			for i, n := range s.nodes {
@@ -119,8 +146,21 @@ func TestMeshExperimentalRekeyFallback(t *testing.T) {
 			if failure == "one handshake" {
 				controls[0].handshake = s.now
 			}
-			if failure == "no handshake" || failure == "one handshake" {
-				s.run(90 * time.Second)
+			if failure == "future handshake" {
+				for _, f := range controls {
+					f.handshake = s.now.Add(time.Hour)
+				}
+			}
+			if failure == "tunnel loss" {
+				s.blockedWG = true
+			}
+			if failure == "next key" {
+				for _, n := range s.nodes {
+					writeTestPSK(t, n.p.spec.PresharedKeyFile, controlTestKey(45).String(), s.now)
+				}
+			}
+			if failure == "no handshake" || failure == "one handshake" || failure == "future handshake" {
+				s.run(rekeyObservationTimeout)
 			} else {
 				s.run(6 * time.Second)
 			}
@@ -133,6 +173,27 @@ func TestMeshExperimentalRekeyFallback(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestMeshExperimentalRekeyObservationDeadline(t *testing.T) {
+	s, controls := rekeySimulation(t)
+	for _, n := range s.nodes {
+		writeTestPSK(t, n.p.spec.PresharedKeyFile, controlTestKey(44).String(), s.now)
+	}
+	s.run(3 * time.Second)
+	deadline := controls[0].p.rekey.appliedAt.Add(rekeyObservationTimeout)
+	s.run(deadline.Sub(s.now) - time.Second)
+	for _, f := range controls {
+		if f.p.rekey == nil || f.restores != 0 || !f.applied {
+			t.Fatal("healthy transport was restored before the observation deadline")
+		}
+	}
+	s.run(2 * time.Second)
+	for _, f := range controls {
+		if f.p.rekey != nil || f.applied || f.restores == 0 {
+			t.Fatal("missing handshake did not restore the hub at the observation deadline")
+		}
 	}
 }
 
