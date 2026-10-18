@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/netip"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -25,6 +26,11 @@ type linkAddr struct {
 	Prefix    netip.Prefix // Retains the local address, not the masked network address.
 	Broadcast netip.Addr
 	Multicast bool
+}
+
+type interfaceState struct {
+	iface    net.Interface
+	prefixes []netip.Prefix
 }
 
 type packet struct {
@@ -153,7 +159,13 @@ func (n *udpNetwork) Send(data []byte, destination netip.AddrPort, link linkAddr
 	if target.Zone() != "" && target.Zone() != link.Name && target.Zone() != zone {
 		return errors.New("destination zone differs from source interface")
 	}
-	if target.Is6() && (target.IsLinkLocalUnicast() || target.IsLinkLocalMulticast()) {
+	if target.Is6() && runtime.GOOS == "linux" {
+		// IPV6_PKTINFO below selects the source interface, including link-local
+		// scope. A numeric UDPAddr.Zone makes x/net scan all interfaces on every
+		// send before it tries parsing the number. Validate zones above, then
+		// use the explicit packet-info index rather than that name cache.
+		destination = netip.AddrPortFrom(target.WithZone(""), destination.Port())
+	} else if target.Is6() && (target.IsLinkLocalUnicast() || target.IsLinkLocalMulticast()) {
 		destination = netip.AddrPortFrom(target.WithZone(zone), destination.Port())
 	}
 	addr := net.UDPAddrFromAddrPort(destination)
@@ -225,7 +237,7 @@ func (n *udpNetwork) receive(v4 bool) {
 	}
 }
 
-// Only failure to enumerate interfaces is fatal; individual failures are logged.
+// Reject incomplete snapshots instead of using partial interface data.
 func (n *udpNetwork) Links() ([]linkAddr, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -234,21 +246,18 @@ func (n *udpNetwork) Links() ([]linkAddr, error) {
 		return nil, net.ErrClosed
 	default:
 	}
-	interfaces, err := net.Interfaces()
+	interfaces, err := readInterfaces()
 	if err != nil {
 		return nil, err
 	}
 	var links []linkAddr
 	wanted := make(map[membership][]netip.Prefix)
-	for _, iface := range interfaces {
+	for _, state := range interfaces {
+		iface := state.iface
 		if !selectInterface(iface, n.include, n.exclude, n.wgName) {
 			continue
 		}
-		prefixes, err := interfacePrefixes(iface)
-		if err != nil {
-			log.Printf("skip addresses on %s: %v", iface.Name, err)
-			continue
-		}
+		prefixes := state.prefixes
 		slices.SortFunc(prefixes, func(a, b netip.Prefix) int { return strings.Compare(a.String(), b.String()) })
 		for _, prefix := range prefixes {
 			if !usableLinkAddress(prefix.Addr()) {
@@ -332,21 +341,18 @@ func broadcastAddress(prefix netip.Prefix) netip.Addr {
 }
 
 func tunnelLink(name string, address netip.Addr) (linkAddr, error) {
-	iface, err := net.InterfaceByName(name)
+	state, err := readInterface(name)
 	if err != nil {
 		return linkAddr{}, err
 	}
+	iface := state.iface
 	if iface.Flags&net.FlagUp == 0 {
 		return linkAddr{}, fmt.Errorf("interface %s is down", name)
 	}
-	prefixes, err := interfacePrefixes(*iface)
-	if err != nil {
-		return linkAddr{}, err
-	}
-	for _, prefix := range prefixes {
+	for _, prefix := range state.prefixes {
 		if prefix.Addr() == address.WithZone("") && usableLinkAddress(address) &&
 			(address.Zone() == "" || address.Zone() == name || address.Zone() == strconv.Itoa(iface.Index)) {
-			return addressedLink(*iface, prefix), nil
+			return addressedLink(iface, prefix), nil
 		}
 	}
 	return linkAddr{}, fmt.Errorf("local tunnel address %s is not assigned to %s", address, name)

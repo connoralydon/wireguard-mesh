@@ -6,7 +6,7 @@ These tests use the NixOS test driver, QEMU/KVM, real kernel WireGuard, and the 
 
 These are full VM integration tests, not mocked network tests or containers. The NixOS test driver starts QEMU directly; it does not use libvirt.
 
-1. [The flake](../flake.nix) builds the Go daemon and exposes six test outputs. [default.nix](default.nix) defines the guest systems with `pkgs.testers.runNixOSTest`. Its `qemu.forceAccel = true` setting requires KVM hardware acceleration.
+1. [The flake](../flake.nix) builds the Go daemon and exposes six mesh checks plus an IPv6 transport check. [default.nix](default.nix) and [ipv6.nix](ipv6.nix) use `pkgs.testers.runNixOSTest`. Their `qemu.forceAccel = true` setting requires KVM hardware acceleration.
 2. The driver starts three guests for the relay-only, shared-LAN, and Rosenpass cases: relay A and nodes B and C. The NAT case adds two router guests. Each guest has its own Linux kernel, interfaces, WireGuard state, and systemd services.
 3. The guests connect through isolated virtual Ethernet networks. The `vlan` numbers in the test configuration identify these test networks; they do not configure VLANs on the host's physical network. Initially, B and C have only A as their WireGuard peer. A forwards their tunnel traffic.
 4. [base.py](base.py) controls the guests through the Python test driver. Commands such as `b.succeed("ip link set lan down")` run inside guest B. [guest.py](guest.py) creates the real WireGuard interfaces, test keys, routes, and NAT rules. Setup commands run as root inside the guests; the mesh daemon runs through its non-root systemd service.
@@ -35,7 +35,8 @@ nix build --no-link --print-out-paths -L --max-jobs 1 \
   path:.#checks.x86_64-linux.nat \
   path:.#checks.x86_64-linux.rosenpass \
   path:.#checks.x86_64-linux.rosenpass-adapter \
-  path:.#checks.x86_64-linux.rosenpass-rekey
+  path:.#checks.x86_64-linux.rosenpass-rekey \
+  path:.#checks.x86_64-linux.ipv6-transport
 ```
 
 The builder needs access to `/dev/kvm` and Nix system features `kvm` and `nixos-test`. Hardware acceleration is required. Libvirt is not used. Allow approximately 4 GiB of guest memory for the largest test, plus host overhead. The first build must download the guest dependencies.
@@ -49,6 +50,60 @@ nix build --rebuild --no-link -L \
   path:.#checks.x86_64-linux.same-lan
 ```
 
+## Opt-in CPU Profiles
+
+The profiling packages are separate from the seven safety checks. They add a
+loopback-only pprof listener to a test build. The normal daemon has no profiling
+listener, and the normal timing defaults are unchanged.
+
+```sh
+nix build --no-link --print-out-paths -L --max-jobs 1 \
+  path:.#packages.x86_64-linux.cpu-profile
+nix build --no-link --print-out-paths -L --max-jobs 1 \
+  path:.#packages.x86_64-linux.cpu-profile-rosenpass
+```
+
+The first target captures three 60-second samples on each daemon for default
+idle operation, default timers with TCP traffic, and the fast test timers. The
+Rosenpass target captures three 60-second samples of both daemons and both
+adapters at default timers, with experimental rekey enabled. These are steady
+samples before a rekey: each requires an unchanged PSK and producer processes,
+with no relay fallback. They do not test a live rekey or prove which PSK
+established a WireGuard handshake. Each daemon has one mesh peer; these are not
+maximum-size benchmarks.
+
+The output contains `b/mesh-artifacts/cpu-results.json`, CPU and allocation
+profiles in both node directories, traffic results, and syscall count summaries.
+CPU use is a percentage of one core, from process user and system CPU counters.
+Allocation rates use Go runtime counters. Syscall tracing runs **after** each
+timed capture; it records counts, not arguments. The tests check direct peer
+state, increasing traffic counters, unchanged process IDs, and relay recovery
+on service stop.
+
+For a paired comparison, import [profile.nix](profile.nix) with `pkgs`, `mesh`
+(the candidate package), and `baseline` (the reference package). Use
+`mode = "rosenpass-rekey"` for the adapter case. The driver alternates package
+order between repetitions and records both package paths in
+`b/mesh-artifacts/profile-builds.json`. Run other builds and VM checks before
+profiling so their load cannot affect the comparison. Compare repeated CPU
+counter measurements as well as sampled functions; VM scheduling, CPU
+frequency, and clock costs can affect individual runs.
+
+With distributed builders, `--max-jobs 1` does not serialize remote VM checks.
+Run one check per build when timing or CPU measurements matter.
+
+Inspect a saved profile with:
+
+```sh
+go tool pprof -top -cum /path/to/output/b/mesh-artifacts/default-idle-candidate-1-daemon-cpu.pprof
+```
+
+The Go tests also check that interface discovery uses one link dump and one
+address dump for 1, 8, and 128 interfaces. These are fresh snapshots, not a
+cross-tick cache. Interrupted dumps are rejected. Controller inspection returns
+one validated WireGuard device per tick; route and key mutations still perform
+their own fresh checks before and after writes.
+
 ## Cases
 
 | Check | Topology and required result |
@@ -59,6 +114,7 @@ nix build --rebuild --no-link -L \
 | `rosenpass` | A shared LAN is available, but missing PSK files prevent direct routing. Real Rosenpass output enables a direct trial. A natural rekey must change the installed PSK and produce a new handshake. Stopping Rosenpass and deleting output must restore A. |
 | `rosenpass-adapter` | Only discovery supplies the LAN endpoints. The packaged adapter must reject unauthorized socket callers and output mappings. A natural rekey retains the child. A prompt daemon restart reuses its valid PSK. LAN renumbering replaces the child and endpoint. Child failure, adapter loss, fresh orphan output, and expiry despite refreshed timestamps must return traffic to A without restarting the mesh daemon. |
 | `rosenpass-rekey` | Both nodes enable the experimental PSK-only operation. A natural rekey must preserve direct peers, endpoints, AllowedIPs, counters, and producer processes. A second rekey with WireGuard handshakes blocked must not complete from working old direct transport; it must fall back within the observation deadline. |
+| `ipv6-transport` | One guest tests real Linux IPv6 link-local unicast and multicast with packet-info source-interface selection. Empty, named, and numeric zones must work. A zone for another interface must be rejected. |
 
 The two-NAT topology is:
 
@@ -86,15 +142,15 @@ The adapter cases reject Rosenpass UDP traffic through `wg0` and the WAN. No tes
 
 ## Results And Limits
 
-All six checks have passed with actual QEMU/KVM execution on `x86_64-linux`. The pinned inputs include Go 1.26.7, Rosenpass 0.2.3, and WireGuard tools 1.0.20260223. The Go race tests, `go vet`, and a 30-second secure-receive fuzz test also passed.
+The original six checks have passed in earlier QEMU/KVM runs on `x86_64-linux`. During performance validation on 18 October 2026, `rosenpass-rekey` failed its first rekey completion assertion on both the unchanged baseline and the optimized binary. Both reached the 90-second handshake observation timeout and restored the relay. The 95-second test wait and its safety assertions were not relaxed. The pinned inputs include Go 1.26.7, Rosenpass 0.2.3, and WireGuard tools 1.0.20260223.
 
-Each output path printed by Nix contains `<node>/mesh-artifacts/`. These directories contain service logs, service state, routes, interface state, and WireGuard state without private or preshared keys. File-only Rosenpass results also include `initial-psk-check.json`, `rekey-psk-check.json`, and relay packet counts. Adapter cases retain captures for exchange, reuse, endpoint replacement, expiry, and experimental rekey outcomes. Recovery cases add `interface-recovery-*.json` markers. The privacy check exports only counts in `packet-privacy.json`; raw packet captures are deleted inside the guest. Private key comparisons and saved recovery-journal copies remain inside the guest and are not exported. Use `nix log` on a check to read the full build log. The driver stops the guests after each test, including failed tests.
+Each mesh output path printed by Nix contains `<node>/mesh-artifacts/`. These directories contain service logs, service state, routes, interface state, and WireGuard state without private or preshared keys. File-only Rosenpass results also include `initial-psk-check.json`, `rekey-psk-check.json`, and relay packet counts. Adapter cases retain captures for exchange, reuse, endpoint replacement, expiry, and experimental rekey outcomes. Recovery cases add `interface-recovery-*.json` markers. The privacy check exports only counts in `packet-privacy.json`; raw packet captures are deleted inside the guest. Private key comparisons and saved recovery-journal copies remain inside the guest and are not exported. The IPv6 transport check records its Go test results in the build log. Use `nix log` on a check to read the full build log. The driver stops the guests after each test, including failed tests.
 
 All generated keys and deterministic WireGuard fixtures are for tests only. Never use them in production. Guest firewall settings and router rules are test fixtures, not deployment policy. Host network settings are not changed.
 
 The VM suite uses short timers: discovery `1s`, broadcast delay `3s`, probes `200ms`, measurement window `5s`, and cooldown `3s`. Failure timeout is `5s` for the two adapter cases and `2s` otherwise. Rosenpass uses its real rekey interval and the default three-minute file age limit. The file-only and adapter cases require one natural rekey; the experimental case requires two. The adapter expiry case waits for the real exchange lifetime. Allow several minutes for each Rosenpass check.
 
-The QEMU suite does not yet test default discovery timings, multiple candidate LANs, IPv6 routing, watchdog expiry, or a crash at every PSK transaction stage. The privacy case forces IPv4 broadcast fallback; it does not disable IPv6 discovery. Adapter fixtures disable IPv6 so that LAN renumbering tests have one address family. Several network and journal fault cases have Go tests, but those are not VM coverage. The opt-in namespace tests remain separate. Only the x86-64 checks have been executed; the flake also defines ARM Linux checks.
+The regular mesh safety cases use fast timers. The opt-in profiles also exercise default timings, but do not replace the fault tests. The suite does not yet cover multiple candidate LANs, IPv6 WireGuard routing, watchdog expiry, or a crash at every PSK transaction stage. The IPv6 transport case checks UDP source-interface selection, not IPv6 WireGuard endpoints. The privacy case forces IPv4 broadcast fallback; it does not disable IPv6 discovery. Adapter fixtures disable IPv6 so that LAN renumbering tests have one address family. Several network and journal fault cases have Go tests, but those are not VM coverage. The opt-in namespace tests remain separate. Only the x86-64 checks have been executed; the flake also defines ARM Linux checks.
 
 The older `rosenpass` case reads file output without adapter exchange status. Producer failure with a retained file can take up to the age limit to disable a direct path. The adapter cases additionally require current exchange status and independent key-possession confirmation.
 

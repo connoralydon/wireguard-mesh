@@ -136,7 +136,7 @@ def main():
             try:
                 conn.sendall(json.dumps(request).encode() + b"\n")
                 data = conn.recv(4096)
-            except ConnectionResetError:
+            except (ConnectionResetError, BrokenPipeError):
                 data = b""
         assert data == b"", "Restricted adapter request was accepted"
     elif command == "block":

@@ -492,3 +492,27 @@ func TestMeshVerifyFailurePreventsConfiguration(t *testing.T) {
 		t.Fatal("preflight failure changed route configuration or trial state")
 	}
 }
+
+func TestMeshCombinedInspectionKeepsMutationPreflight(t *testing.T) {
+	s := newMeshSimulation(t)
+	s.run(2200 * time.Millisecond)
+	n := s.nodes[0]
+	inspections, verifications := 0, 0
+	injected := errors.New("mutation preflight failed")
+	n.m.inspect = func() error { inspections++; return nil }
+	n.m.verify = func() error { verifications++; return injected }
+	if err := n.m.tick(s.now); err != nil || inspections != 1 || verifications != 0 {
+		t.Fatal("tick did not use exactly one combined inspection")
+	}
+	n.p.selected = n.m.candidate(n.p, n.lan, netip.AddrPortFrom(n.other.lan.Prefix.Addr(), n.m.c.Port), s.now)
+	n.p.phase, n.p.trial = "prepared", "fresh-preflight"
+	msg := message{Op: "commit", Token: n.p.trial, Port: n.other.m.wgPort}
+	msg.Proof = pskProof(n.p.spec.psk, msg.Op, msg.Token, n.other.m.public, n.m.public)
+	if err := n.m.coordinate(n.p, n.p.selected, msg, s.now); !errors.Is(err, injected) || verifications != 1 || n.applies != 0 {
+		t.Fatal("combined inspection suppressed fresh mutation preflight")
+	}
+	n.m.inspect = func() error { inspections++; return injected }
+	if err := n.m.tick(s.now); !errors.Is(err, injected) || inspections != 2 || n.applies != 0 {
+		t.Fatal("failed combined inspection did not stop the tick")
+	}
+}

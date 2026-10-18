@@ -1,4 +1,9 @@
-{ pkgs, mesh }:
+{
+  pkgs,
+  mesh,
+  profile ? false,
+  baseline ? mesh,
+}:
 let
   inherit (pkgs) lib;
   template = pkgs.runCommand "wireguard-mesh-test-unit" { } ''
@@ -63,6 +68,10 @@ let
       User = "mesh-wg0";
       SupplementaryGroups = [ "mesh-psk-wg0" ];
     };
+    systemd.services."wireguard-mesh-rosenpass@wg0" = lib.mkIf profile {
+      overrideStrategy = "asDropin";
+      serviceConfig.Environment = [ "WGMESH_PPROF_ADDR=127.0.0.1:6061" ];
+    };
     # Keep mesh running when the adapter stops so its own fallback is tested.
     # These cases test IPv4 endpoint changes, not IPv6 address selection.
     boot.kernel.sysctl."net.ipv6.conf.all.disable_ipv6" = 1;
@@ -107,7 +116,7 @@ let
   makeTest =
     mode:
     pkgs.testers.runNixOSTest {
-      name = "wireguard-mesh-${mode}";
+      name = "wireguard-mesh-${mode}${lib.optionalString profile "-cpu-profile"}";
       qemu.forceAccel = true;
       defaults = {
         virtualisation.memorySize = 768;
@@ -118,22 +127,37 @@ let
           "wireguard"
           "sch_netem"
         ];
-        environment.systemPackages = with pkgs; [
-          mesh
-          guest
-          recoveryGuest
-          privacyGuest
-          adapterGuest
-          wireguard-tools
-          iproute2
-          iptables
-          tcpdump
-        ];
+        environment.systemPackages =
+          with pkgs;
+          [
+            mesh
+            guest
+            recoveryGuest
+            privacyGuest
+            adapterGuest
+            wireguard-tools
+            iproute2
+            iptables
+            tcpdump
+          ]
+          ++ lib.optionals profile [
+            curl
+            iperf
+            python3
+            strace
+          ];
         systemd.packages = [ template ];
         # Keep crash recovery observable before the normal automatic restart.
         systemd.services."wireguard-meshd@wg0" = {
           overrideStrategy = "asDropin";
-          serviceConfig.RestartSec = "15s";
+          serviceConfig = {
+            RestartSec = "15s";
+            Environment = lib.optionals profile [
+              "WGMESH_PPROF_ADDR=127.0.0.1:6060"
+              # Include the comparison binary in the guest closure, not its PATH.
+              "WGMESH_PROFILE_BASELINE=${baseline}/bin/wireguard-meshd"
+            ];
+          };
         };
       };
       nodes = {
@@ -266,13 +290,24 @@ let
           boot.kernel.sysctl."net.ipv4.ip_forward" = 1;
         };
       };
-      testScript = ''
-        mode = "${mode}"
-        ${builtins.readFile ./rosenpass.py}
-        ${builtins.readFile ./adapter.py}
-        ${builtins.readFile ./recovery.py}
-        ${builtins.readFile ./base.py}
-      '';
+      testScript =
+        if profile then
+          ''
+            mode = "${mode}"
+            profile_binaries = {"candidate": "${mesh}/bin/wireguard-meshd"}
+            ${lib.optionalString (toString baseline != toString mesh) ''
+              profile_binaries["baseline"] = "${baseline}/bin/wireguard-meshd"
+            ''}
+            ${builtins.readFile ./profile.py}
+          ''
+        else
+          ''
+            mode = "${mode}"
+            ${builtins.readFile ./rosenpass.py}
+            ${builtins.readFile ./adapter.py}
+            ${builtins.readFile ./recovery.py}
+            ${builtins.readFile ./base.py}
+          '';
     };
 in
 lib.genAttrs [

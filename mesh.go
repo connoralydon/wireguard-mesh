@@ -152,6 +152,7 @@ type mesh struct {
 	dry       bool
 	notify    func()
 	verify    func() error
+	inspect   func() error // Optional combined controller and runtime tick check.
 	rosenpass func(string, rosenpassRequest) (rosenpassResponse, error)
 }
 
@@ -411,12 +412,18 @@ func (m *mesh) qualified(p *meshPeer, c *path, now time.Time) (time.Duration, bo
 
 func (m *mesh) tick(now time.Time) error {
 	started := time.Now()
-	if err := m.control.Check(); err != nil {
-		return err
-	}
-	if m.verify != nil {
-		if err := m.verify(); err != nil {
+	if m.inspect != nil {
+		if err := m.inspect(); err != nil {
 			return err
+		}
+	} else {
+		if err := m.control.Check(); err != nil {
+			return err
+		}
+		if m.verify != nil {
+			if err := m.verify(); err != nil {
+				return err
+			}
 		}
 	}
 	for id, s := range m.starts {

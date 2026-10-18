@@ -70,6 +70,7 @@ func run(args []string) (err error) {
 	}
 	defer client.Close()
 	var control routeControl
+	var checkDevice func() (*wgtypes.Device, error)
 	var private wgtypes.Key
 	var port int
 	if *dry {
@@ -83,7 +84,8 @@ func run(args []string) (err error) {
 			return e
 		}
 		private, port = d.PrivateKey, d.ListenPort
-		control = &readOnlyControl{client, *name, d.PublicKey}
+		readOnly := &readOnlyControl{client, *name, d.PublicKey}
+		control, checkDevice = readOnly, readOnly.checkDevice
 	} else {
 		resolved, unlock, e := lockJournal(*state)
 		if e != nil {
@@ -99,6 +101,7 @@ func run(args []string) (err error) {
 			return nil
 		}
 		control = c
+		checkDevice = c.checkDevice
 		private, port = c.Identity()
 	}
 	f, err := os.Open(*file)
@@ -140,28 +143,35 @@ func run(args []string) (err error) {
 	m := newMesh(c, n, control, private, uint16(port), tunnel, *dry)
 	m.notify = func() { notify("WATCHDOG=1") }
 	m.verify = func() error {
-		current, err := tunnelLink(*name, c.Address)
-		if err != nil {
-			return err
-		}
-		if current.Index != tunnel.Index {
-			return errors.New("WireGuard interface was replaced")
-		}
-		d, err := client.Device(*name)
-		if err != nil {
-			return err
-		}
-		if d.ListenPort != port {
-			return errors.New("WireGuard listen port changed")
-		}
-		return checkRoutes(*name, c.Address, c.Peers)
+		return checkRuntime(*name, c, tunnel, port, checkDevice)
 	}
+	// The runtime check includes controller validation and the listen port from
+	// one device read. Mutation preflight calls verify again, not a cached result.
+	m.inspect = m.verify
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 	notify("READY=1")
 	defer notify("STOPPING=1")
 	slog.Info("discovery started", "wireguard", *name, "multicast4", c.Multicast4, "multicast6", c.Multicast6, "port", c.Port, "dry_run", *dry)
 	return m.run(ctx)
+}
+
+func checkRuntime(name string, c config, tunnel linkAddr, port int, device func() (*wgtypes.Device, error)) error {
+	current, err := tunnelLink(name, c.Address)
+	if err != nil {
+		return err
+	}
+	if current.Index != tunnel.Index {
+		return errors.New("WireGuard interface was replaced")
+	}
+	d, err := device()
+	if err != nil {
+		return err
+	}
+	if d.ListenPort != port {
+		return errors.New("WireGuard listen port changed")
+	}
+	return checkLinkRoutes(current.Index, c.Address, c.Peers)
 }
 
 func checkPeers(d *wgtypes.Device, peers []peerSpec) error {
@@ -235,11 +245,16 @@ type readOnlyControl struct {
 }
 
 func (c *readOnlyControl) Check() error {
+	_, err := c.checkDevice()
+	return err
+}
+
+func (c *readOnlyControl) checkDevice() (*wgtypes.Device, error) {
 	d, err := c.client.Device(c.name)
 	if err == nil && d.PublicKey != c.public {
-		return errors.New("WireGuard identity changed")
+		return nil, errors.New("WireGuard identity changed")
 	}
-	return err
+	return d, err
 }
 func (*readOnlyControl) Apply(wgtypes.Key, netip.Addr, wgtypes.Key, netip.AddrPort) error {
 	return errors.New("dry run cannot apply routes")

@@ -392,22 +392,29 @@ func (c *controller) restore(key wgtypes.Key) error {
 }
 
 func (c *controller) Check() error {
+	_, err := c.checkDevice()
+	return err
+}
+
+// Return this inspection's device without retaining a snapshot across ticks or
+// writes. Apply, Rekey, and Restore still perform their own fresh reads.
+func (c *controller) checkDevice() (*wgtypes.Device, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	d, err := c.device()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	for text, r := range c.journal.Peers {
 		key, _ := wgtypes.ParseKey(text)
 		if err := c.checkPeer(d, key, r); err != nil {
-			return err
+			return nil, err
 		}
 		if r.Phase != "active" {
-			return errors.New("unfinished peer recovery")
+			return nil, errors.New("unfinished peer recovery")
 		}
 	}
-	return nil
+	return d, nil
 }
 
 func (c *controller) device() (*wgtypes.Device, error) {

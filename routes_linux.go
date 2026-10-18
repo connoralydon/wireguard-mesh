@@ -15,13 +15,17 @@ func checkRoutes(name string, source netip.Addr, peers []peerSpec) error {
 	if err != nil {
 		return err
 	}
+	return checkLinkRoutes(link.Index, source, peers)
+}
+
+func checkLinkRoutes(index int, source netip.Addr, peers []peerSpec) error {
 	for _, peer := range peers {
 		routes, err := netlink.RouteGetWithOptions(net.IP(peer.IP.AsSlice()), &netlink.RouteGetOptions{SrcAddr: net.IP(source.AsSlice())})
 		if err != nil {
 			return err
 		}
-		if len(routes) != 1 || routes[0].LinkIndex != link.Index || len(routes[0].MultiPath) != 0 {
-			return fmt.Errorf("stable route to %s must select %s; policy/multipath route changes are unsupported", peer.IP, name)
+		if len(routes) != 1 || routes[0].LinkIndex != index || len(routes[0].MultiPath) != 0 {
+			return fmt.Errorf("stable route to %s must select interface %d; policy/multipath route changes are unsupported", peer.IP, index)
 		}
 	}
 	return nil

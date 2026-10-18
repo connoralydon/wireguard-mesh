@@ -1,0 +1,34 @@
+package main
+
+// Included only by the opt-in QEMU profiling package, never the normal daemon.
+import (
+	"encoding/json"
+	"log"
+	"net/http"
+	_ "net/http/pprof"
+	"os"
+	"runtime"
+)
+
+func init() {
+	address := os.Getenv("WGMESH_PPROF_ADDR")
+	if address == "" {
+		return
+	}
+	for _, arg := range os.Args[1:] {
+		if arg == "-restore" {
+			return
+		}
+	}
+	http.HandleFunc("/profile/metrics", func(w http.ResponseWriter, r *http.Request) {
+		var stats runtime.MemStats
+		runtime.ReadMemStats(&stats)
+		_ = json.NewEncoder(w).Encode(map[string]uint64{
+			"total_alloc_bytes": stats.TotalAlloc,
+			"mallocs":           stats.Mallocs,
+			"heap_bytes":        stats.HeapAlloc,
+			"gc_cycles":         uint64(stats.NumGC),
+		})
+	})
+	go func() { log.Print(http.ListenAndServe(address, nil)) }()
+}

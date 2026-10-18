@@ -17,36 +17,56 @@
         ] (system: f nixpkgs.legacyPackages.${system});
     in
     {
-      packages = forAllSystems (pkgs: {
-        default = pkgs.buildGo126Module {
-          pname = "wireguard-meshd";
-          version = "0.1.0";
-          src = pkgs.lib.cleanSourceWith {
-            src = ./.;
-            filter =
-              path: type:
-              type == "regular"
-              && (
-                pkgs.lib.hasSuffix ".go" path
-                || builtins.elem (baseNameOf path) [
-                  "go.mod"
-                  "go.sum"
-                ]
-              );
+      packages = forAllSystems (
+        pkgs:
+        {
+          default = pkgs.buildGo126Module {
+            pname = "wireguard-meshd";
+            version = "0.1.0";
+            src = pkgs.lib.cleanSourceWith {
+              src = ./.;
+              filter =
+                path: type:
+                type == "regular"
+                && (
+                  pkgs.lib.hasSuffix ".go" path
+                  || builtins.elem (baseNameOf path) [
+                    "go.mod"
+                    "go.sum"
+                  ]
+                );
+            };
+            vendorHash = "sha256-2BLFPdWkemykGEcCQGb704+PQJh+0+cARsISvq/9H6Y=";
+            postInstall = ''
+              mv "$out/bin/wireguard-mesh" "$out/bin/wireguard-meshd"
+            '';
+            meta.platforms = pkgs.lib.platforms.linux;
           };
-          vendorHash = "sha256-2BLFPdWkemykGEcCQGb704+PQJh+0+cARsISvq/9H6Y=";
-          postInstall = ''
-            mv "$out/bin/wireguard-mesh" "$out/bin/wireguard-meshd"
-          '';
-          meta.platforms = pkgs.lib.platforms.linux;
-        };
-      });
+        }
+        // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+          cpu-profile = import ./tests/profile.nix {
+            inherit pkgs;
+            mesh = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+          };
+          cpu-profile-rosenpass = import ./tests/profile.nix {
+            inherit pkgs;
+            mesh = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+            mode = "rosenpass-rekey";
+          };
+        }
+      );
 
       checks = nixpkgs.lib.genAttrs [ "x86_64-linux" "aarch64-linux" ] (
         system:
-        import ./tests {
+        (import ./tests {
           pkgs = nixpkgs.legacyPackages.${system};
           mesh = self.packages.${system}.default;
+        })
+        // {
+          ipv6-transport = import ./tests/ipv6.nix {
+            pkgs = nixpkgs.legacyPackages.${system};
+            mesh = self.packages.${system}.default;
+          };
         }
       );
 

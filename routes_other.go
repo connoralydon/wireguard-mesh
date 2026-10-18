@@ -7,4 +7,5 @@ import (
 	"net/netip"
 )
 
-func checkRoutes(string, netip.Addr, []peerSpec) error { return errors.New("Linux is required") }
+func checkRoutes(string, netip.Addr, []peerSpec) error  { return errors.New("Linux is required") }
+func checkLinkRoutes(int, netip.Addr, []peerSpec) error { return errors.New("Linux is required") }
