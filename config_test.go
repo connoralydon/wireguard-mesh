@@ -17,9 +17,11 @@ func TestConfigDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := config{
-		Address: netip.MustParseAddr("10.0.0.2"),
-		Peers:   []peerSpec{{PublicKey: key.String(), IP: netip.MustParseAddr("10.0.0.3"), PresharedKey: psk.String(), key: key, psk: psk}},
-		Port:    51823, Multicast4: netip.MustParseAddr("239.255.77.77"), Multicast6: netip.MustParseAddr("ff12::5747:4d53"),
+		Version:     1,
+		RouteMetric: 50,
+		Address:     netip.MustParseAddr("10.0.0.2"),
+		Peers:       []peerSpec{{PublicKey: key.String(), IP: netip.MustParseAddr("10.0.0.3"), PresharedKey: psk.String(), key: key, psk: psk}},
+		Port:        51823, Multicast4: netip.MustParseAddr("239.255.77.77"), Multicast6: netip.MustParseAddr("ff12::5747:4d53"),
 		Discovery: duration(time.Minute), BroadcastAfter: duration(5 * time.Minute),
 		Probe: duration(time.Second), Window: duration(15 * time.Second), Failure: duration(5 * time.Second),
 		Cooldown: duration(30 * time.Second), MinGain: duration(2 * time.Millisecond), Gain: 0.2,
@@ -31,6 +33,37 @@ func TestConfigDefaults(t *testing.T) {
 	text = strings.ReplaceAll(text, "10.0.0.3", "fd00::3")
 	if _, err := readConfig(strings.NewReader(text)); err != nil {
 		t.Fatal("valid IPv6 configuration:", err)
+	}
+}
+
+func TestConfigAutomaticInterface(t *testing.T) {
+	base := fmt.Sprintf(`"address":"10.0.0.2","peers":[{"public_key":%q,"ip":"10.0.0.3"}]`, controlTestKey(7).PublicKey().String())
+	for _, tc := range []struct {
+		fields string
+		name   string
+		port   uint16
+	}{
+		{`"version":2`, "auto", 0},
+		{`"version":2,"direct_listen_port":51821`, "auto", 51821},
+		{`"version":2,"direct_interface":""`, "", 0},
+		{`"version":2,"direct_interface":"wg-direct"`, "wg-direct", 0},
+		{`"version":1`, "", 0},
+		{`"version":1,"direct_interface":"auto"`, "auto", 0},
+	} {
+		c, err := readConfig(strings.NewReader("{" + base + "," + tc.fields + "}"))
+		if err != nil || c.DirectInterface != tc.name || c.DirectListenPort != tc.port {
+			t.Fatalf("automatic interface configuration mismatch: %v", err)
+		}
+	}
+	for _, fields := range []string{
+		`"version":0`, `"version":3`, `"version":2,"direct_interface":null`,
+		`"direct_listen_port":51821`, `"version":2,"direct_listen_port":51823`,
+		`"version":2,"direct_interface":"wg-direct","direct_listen_port":51821`,
+		`"version":2,"nat_traversal":{"stun_servers":["203.0.113.1:3478"]}`,
+	} {
+		if _, err := readConfig(strings.NewReader("{" + base + "," + fields + "}")); err == nil {
+			t.Fatal("invalid automatic interface configuration accepted")
+		}
 	}
 }
 

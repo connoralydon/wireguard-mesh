@@ -24,11 +24,14 @@ type routeControl interface {
 }
 
 type message struct {
-	Op    string `json:"op"`
-	Token string `json:"token"`
-	Port  uint16 `json:"port"`
-	Proof string `json:"proof,omitempty"`
-	Rekey bool   `json:"experimental_rekey,omitempty"`
+	Op        string     `json:"op"`
+	Token     string     `json:"token"`
+	Port      uint16     `json:"port"`
+	Proof     string     `json:"proof,omitempty"`
+	Rekey     bool       `json:"experimental_rekey,omitempty"`
+	Endpoint  string     `json:"endpoint,omitempty"`
+	RouteMode bool       `json:"route_mode,omitempty"`
+	ICE       *iceSignal `json:"ice,omitempty"`
 }
 
 type sample struct {
@@ -71,6 +74,7 @@ func improves(candidate, baseline time.Duration, c config) bool {
 }
 
 type path struct {
+	nat      bool
 	link     linkAddr
 	addr     netip.AddrPort
 	session  [16]byte
@@ -136,24 +140,32 @@ type meshPeer struct {
 	cooldown       time.Time
 	retired        map[string]time.Time
 	retiredUntil   time.Time
+	signal         [16]byte
+	signalNext     time.Time
+	signalLast     time.Time
+	signalToken    string
+	natOffer       netip.AddrPort
+	natOfferAt     time.Time
 }
 
 type mesh struct {
-	c         config
-	net       network
-	control   routeControl
-	crypto    *secure
-	public    wgtypes.Key
-	wgPort    uint16
-	tunnel    linkAddr
-	peers     map[wgtypes.Key]*meshPeer
-	starts    map[[16]byte]start
-	links     []linkAddr
-	dry       bool
-	notify    func()
-	verify    func() error
-	inspect   func() error // Optional combined controller and runtime tick check.
-	rosenpass func(string, rosenpassRequest) (rosenpassResponse, error)
+	c            config
+	net          network
+	control      routeControl
+	crypto       *secure
+	public       wgtypes.Key
+	wgPort       uint16
+	tunnel       linkAddr
+	peers        map[wgtypes.Key]*meshPeer
+	starts       map[[16]byte]start
+	links        []linkAddr
+	dry          bool
+	notify       func()
+	verify       func() error
+	inspect      func() error // Optional combined controller and runtime tick check.
+	rosenpass    func(string, rosenpassRequest) (rosenpassResponse, error)
+	nat          *natState
+	directTunnel linkAddr
 }
 
 func newMesh(c config, n network, control routeControl, private wgtypes.Key, port uint16, tunnel linkAddr, dry bool) *mesh {
@@ -169,6 +181,10 @@ func newMesh(c config, n network, control routeControl, private wgtypes.Key, por
 }
 
 func (m *mesh) run(ctx context.Context) error {
+	var raw <-chan packet
+	if m.nat != nil {
+		raw = m.nat.transport.Incoming()
+	}
 	ticker := time.NewTicker(time.Duration(m.c.Probe))
 	defer ticker.Stop()
 	if err := m.refresh(time.Now()); err != nil {
@@ -186,6 +202,13 @@ func (m *mesh) run(ctx context.Context) error {
 				return errors.New("discovery sockets closed")
 			}
 			if err := m.receive(p, time.Now()); err != nil {
+				return err
+			}
+		case p, ok := <-raw:
+			if !ok {
+				return errors.New("WireGuard traversal socket closed")
+			}
+			if err := m.receiveWireGuard(p, time.Now()); err != nil {
 				return err
 			}
 		case _, ok := <-m.net.Changed():
@@ -255,12 +278,27 @@ func (m *mesh) lan(packet packet) (linkAddr, bool) {
 }
 
 func (m *mesh) receive(packet packet, now time.Time) error {
+	return m.receivePacket(packet, now, false)
+}
+
+func (m *mesh) receivePacket(packet packet, now time.Time, raw bool) error {
 	started := time.Now()
-	if packet.Source.Port() != m.c.Port {
+	if !raw && packet.Source.Port() != m.c.Port {
 		return nil
 	}
 	link, lan := m.lan(packet)
-	tunnel := packet.IfIndex == m.tunnel.Index && packet.Destination == m.c.Address
+	if raw {
+		if m.nat == nil || !validNATEndpoint(packet.Source) {
+			return nil
+		}
+		var ok bool
+		link, ok = m.rawLink(packet)
+		if !ok {
+			return nil
+		}
+		lan = true // A separate authenticated path, not relaxed LAN validation.
+	}
+	tunnel := !raw && (packet.IfIndex == m.tunnel.Index || m.directTunnel.Index > 0 && packet.IfIndex == m.directTunnel.Index) && packet.Destination == m.c.Address
 	if !lan && !tunnel {
 		return nil
 	}
@@ -272,9 +310,16 @@ func (m *mesh) receive(packet packet, now time.Time) error {
 	if p == nil || tunnel && packet.Source.Addr() != p.spec.IP {
 		return nil
 	}
+	if raw && !m.rawAuthorized(p, packet.Source, now) {
+		return nil
+	}
 	if len(event.Reply) != 0 {
-		if lan {
+		if raw {
+			_ = m.nat.transport.Send(event.Reply, packet.Source)
+		} else if lan {
 			_ = m.net.Send(event.Reply, packet.Source, link)
+		} else if tunnel && m.nat != nil {
+			_ = m.net.Send(event.Reply, packet.Source, m.tunnel)
 		}
 		return nil
 	}
@@ -282,6 +327,24 @@ func (m *mesh) receive(packet packet, now time.Time) error {
 		return nil
 	}
 	if event.Body == nil {
+		if m.nat != nil {
+			s, ok := m.nat.starts[event.ID]
+			if ok && s.peer == event.Peer && now.Sub(s.at) < 10*time.Second {
+				if tunnel && !s.endpoint.IsValid() {
+					delete(m.nat.starts, event.ID)
+					p.signal, p.signalNext, p.signalLast = event.ID, time.Time{}, now
+					return nil
+				}
+				if raw && s.endpoint.Addr() == packet.Source.Addr() {
+					delete(m.nat.starts, event.ID)
+					candidate := m.wireGuardCandidate(p, link, packet.Source, now)
+					if candidate != nil {
+						m.ping(p, candidate, event.ID, false, now)
+					}
+					return nil
+				}
+			}
+		}
 		s, ok := m.starts[event.ID]
 		delete(m.starts, event.ID)
 		if !ok || !lan || s.key != event.Peer || s.link != link {
@@ -297,11 +360,33 @@ func (m *mesh) receive(packet packet, now time.Time) error {
 	if json.Unmarshal(event.Body, &msg) != nil || len(msg.Token) > 64 || len(msg.Proof) > 64 || msg.Token == "" || msg.Port == 0 {
 		return nil
 	}
+	if tunnel && m.nat != nil {
+		switch msg.Op {
+		case "signal":
+			p.signal, p.signalLast = event.ID, now
+			m.receiveEndpoint(p, event.ID, msg, now)
+			m.send(event.ID, message{Op: "signal-pong", Token: msg.Token, Port: m.wgPort}, packet.Source, m.tunnel, now)
+			return nil
+		case "signal-pong":
+			if p.signal == event.ID && msg.Token == p.signalToken {
+				p.signalLast, p.signalToken = now, ""
+			}
+			return nil
+		}
+	}
 	var candidate *path
 	if lan {
-		candidate = p.paths[pathName(link, packet.Source)]
+		name := pathName(link, packet.Source)
+		if raw {
+			name = "wg/" + name
+		}
+		candidate = p.paths[name]
 		if msg.Op == "ping" {
-			candidate = m.candidate(p, link, packet.Source, now)
+			if raw {
+				candidate = m.wireGuardCandidate(p, link, packet.Source, now)
+			} else {
+				candidate = m.candidate(p, link, packet.Source, now)
+			}
 		}
 		if candidate == nil {
 			return nil
@@ -311,8 +396,15 @@ func (m *mesh) receive(packet packet, now time.Time) error {
 	case "ping":
 		if tunnel {
 			link = m.tunnel
+			if packet.IfIndex == m.directTunnel.Index {
+				link = m.directTunnel
+			}
 		}
-		m.send(event.ID, message{Op: "pong", Token: msg.Token, Port: m.wgPort}, packet.Source, link, now)
+		if raw {
+			m.sendPath(event.ID, message{Op: "pong", Token: msg.Token, Port: m.wgPort}, candidate, now)
+		} else {
+			m.send(event.ID, message{Op: "pong", Token: msg.Token, Port: m.wgPort}, packet.Source, link, now)
+		}
 		if lan {
 			candidate.incoming = event.ID
 		}
@@ -327,6 +419,9 @@ func (m *mesh) receive(packet packet, now time.Time) error {
 			p.lastTunnel = now
 		} else {
 			candidate.session, candidate.port = event.ID, msg.Port
+			if raw {
+				candidate.port = packet.Source.Port()
+			}
 			if q.measure {
 				candidate.stats.add(now, now.Sub(q.at), time.Duration(m.c.Window))
 			}
@@ -358,6 +453,16 @@ func (m *mesh) candidate(p *meshPeer, link linkAddr, addr netip.AddrPort, now ti
 	return c
 }
 
+func (m *mesh) wireGuardCandidate(p *meshPeer, link linkAddr, addr netip.AddrPort, now time.Time) *path {
+	name := "wg/" + pathName(link, addr)
+	c := p.paths[name]
+	if c == nil && len(p.paths) < 16 {
+		c = &path{nat: true, link: link, addr: addr, stats: measurements{since: now}}
+		p.paths[name] = c
+	}
+	return c
+}
+
 func (m *mesh) send(id [16]byte, msg message, addr netip.AddrPort, link linkAddr, now time.Time) bool {
 	body, _ := json.Marshal(msg)
 	data, err := m.crypto.Seal(id, body, now)
@@ -369,11 +474,21 @@ func (m *mesh) ping(p *meshPeer, candidate *path, id [16]byte, multicast bool, n
 		return
 	}
 	addr, link := netip.AddrPortFrom(p.spec.IP, m.c.Port), m.tunnel
+	if candidate == nil && m.directTunnel.Index > 0 && (p.phase == "trial" || p.phase == "active") {
+		link = m.directTunnel
+	}
 	if candidate != nil {
 		addr, link = candidate.addr, candidate.link
 	}
 	token := rand.Text()
-	if m.send(id, message{Op: "ping", Token: token, Port: m.wgPort}, addr, link, now) {
+	msg := message{Op: "ping", Token: token, Port: m.wgPort}
+	sent := false
+	if candidate != nil && candidate.nat {
+		sent = m.sendPath(id, msg, candidate, now)
+	} else {
+		sent = m.send(id, msg, addr, link, now)
+	}
+	if sent {
 		p.pending[token] = probe{candidate, now, id, multicast, candidate == nil || id == candidate.session}
 	}
 }
@@ -393,6 +508,11 @@ func (m *mesh) fresh(c *path, now time.Time) bool {
 }
 
 func (m *mesh) qualified(p *meshPeer, c *path, now time.Time) (time.Duration, bool) {
+	// Apply the LAN preference to received proposals as well as local choices.
+	// ICE must not displace an active, healthy normal LAN path.
+	if p.phase == "active" && p.selected != nil && !p.selected.nat && c.nat && m.fresh(p.selected, now) {
+		return 0, false
+	}
 	// The pinned wgctrl Linux encoder omits sockaddr_in6 scope IDs. Discovery
 	// still works, but do not install an ambiguous link-local WireGuard endpoint.
 	if c.addr.Addr().Is6() && c.addr.Addr().IsLinkLocalUnicast() {
@@ -412,6 +532,7 @@ func (m *mesh) qualified(p *meshPeer, c *path, now time.Time) (time.Duration, bo
 
 func (m *mesh) tick(now time.Time) error {
 	started := time.Now()
+	m.natTick(now)
 	if m.inspect != nil {
 		if err := m.inspect(); err != nil {
 			return err
@@ -436,6 +557,7 @@ func (m *mesh) tick(now time.Time) error {
 		used[id] = true
 	}
 	for _, p := range m.peers {
+		used[p.signal] = true
 		for _, c := range p.paths {
 			used[c.session], used[c.incoming] = true, true
 		}
@@ -445,6 +567,7 @@ func (m *mesh) tick(now time.Time) error {
 	}
 	m.crypto.Prune(used, now)
 	for _, p := range m.peers {
+		m.signalTick(p, now)
 		pskOK, err := m.pollPSK(p, now.Add(time.Since(started)))
 		if err != nil {
 			return err
@@ -488,6 +611,7 @@ func (m *mesh) tick(now time.Time) error {
 				delete(p.paths, name)
 				continue
 			}
+			m.renewNATSession(p, c, now)
 			id := c.session
 			if m.crypto.sessions[id] == nil {
 				// Validate a received session on the timer, not in response to every
@@ -528,7 +652,8 @@ func (m *mesh) tick(now time.Time) error {
 			}
 			if b, ok := m.qualified(p, c, checkedAt); ok {
 				rtt, _ := c.stats.median(checkedAt, m.c)
-				if best == nil || rtt < bestRTT {
+				// Prefer normal LAN discovery when both transports qualify.
+				if best == nil || best.nat && !c.nat || best.nat == c.nat && rtt < bestRTT {
 					best, bestRTT, base = c, rtt, b
 				}
 			}
@@ -541,6 +666,9 @@ func (m *mesh) tick(now time.Time) error {
 				p.replacement = &routeProposal{path: best, phase: "prepare", token: rand.Text(), since: checkedAt, baseline: base}
 				m.pathCommand(p, best, p.replacement.token, "prepare", checkedAt)
 			} else {
+				if _, err := m.stage(p, best); err != nil {
+					return err
+				}
 				p.selected, p.phase, p.trial, p.since, p.baseline = best, "prepare", rand.Text(), checkedAt, base
 				p.localGood, p.remoteGood, p.committed = false, false, false
 				m.command(p, "prepare", checkedAt)
@@ -556,9 +684,9 @@ func (m *mesh) command(p *meshPeer, op string, now time.Time) {
 
 func (m *mesh) pathCommand(p *meshPeer, c *path, token, op string, now time.Time) {
 	if c != nil {
-		msg := message{Op: op, Token: token, Port: m.wgPort, Rekey: p.spec.ExperimentalRekey}
+		msg := message{Op: op, Token: token, Port: m.wgPort, Rekey: p.spec.ExperimentalRekey, RouteMode: m.c.DirectInterface != ""}
 		msg.Proof = pskProof(p.spec.psk, op, token, m.public, p.spec.key)
-		m.send(c.session, msg, c.addr, c.link, now)
+		m.sendPath(c.session, msg, c, now)
 	}
 }
 
@@ -621,6 +749,9 @@ func (m *mesh) coordinate(p *meshPeer, c *path, msg message, now time.Time) erro
 		}
 	}
 	if msg.Op == "prepare" || msg.Op == "ready" || msg.Op == "commit" {
+		if msg.RouteMode != (m.c.DirectInterface != "") {
+			return nil // Both ends must agree on staging before either changes a route.
+		}
 		if ok, err := m.pollPSK(p, now); err != nil || !ok {
 			return err
 		}
@@ -638,7 +769,13 @@ func (m *mesh) coordinate(p *meshPeer, c *path, msg message, now time.Time) erro
 				p.localGood, p.remoteGood, p.committed = false, false, false
 				p.remoteRekey = msg.Rekey
 			}
-			m.pathCommand(p, c, msg.Token, "ready", now)
+			ready, err := m.stage(p, c)
+			if err != nil {
+				return err
+			}
+			if ready {
+				m.pathCommand(p, c, msg.Token, "ready", now)
+			}
 		} else {
 			m.retire(p, msg.Token, now)
 		}
@@ -695,7 +832,13 @@ func (m *mesh) coordinate(p *meshPeer, c *path, msg message, now time.Time) erro
 	switch msg.Op {
 	case "prepare":
 		if p.phase == "prepared" {
-			m.command(p, "ready", now)
+			ready, err := m.stage(p, c)
+			if err != nil {
+				return err
+			}
+			if ready {
+				m.command(p, "ready", now)
+			}
 		}
 	case "ready":
 		if p.phase == "prepare" {
@@ -803,7 +946,13 @@ func (m *mesh) advance(p *meshPeer, now time.Time) error {
 		if p.phase == "prepare" {
 			m.command(p, "prepare", now)
 		} else {
-			m.command(p, "ready", now)
+			ready, err := m.stage(p, p.selected)
+			if err != nil {
+				return err
+			}
+			if ready {
+				m.command(p, "ready", now)
+			}
 		}
 	case "trial", "active":
 		last := p.lastTunnel

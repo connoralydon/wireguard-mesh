@@ -73,11 +73,14 @@ func run(args []string) (err error) {
 	var checkDevice func() (*wgtypes.Device, error)
 	var private wgtypes.Key
 	var port int
+	var journalPath string
 	if *dry {
-		if _, e := os.Stat(*state); e == nil {
-			return errors.New("recover and remove the old journal before a dry run")
-		} else if !errors.Is(e, os.ErrNotExist) {
-			return e
+		for _, path := range []string{*state, *state + ".routes", *state + ".interface"} {
+			if _, e := os.Stat(path); e == nil {
+				return errors.New("recover and remove the old journals before a dry run")
+			} else if !errors.Is(e, os.ErrNotExist) {
+				return e
+			}
 		}
 		d, e := client.Device(*name)
 		if e != nil {
@@ -92,6 +95,13 @@ func run(args []string) (err error) {
 			return e
 		}
 		defer unlock()
+		journalPath = resolved
+		if e := recoverRouteController(client, *name, resolved+".routes"); e != nil {
+			return e
+		}
+		if e := recoverDirectInterface(client, *name, resolved+".interface"); e != nil {
+			return e
+		}
 		c, e := newController(client, *name, resolved)
 		if e != nil {
 			return e
@@ -135,15 +145,67 @@ func run(args []string) (err error) {
 	if err := checkRoutes(*name, c.Address, c.Peers); err != nil {
 		return err
 	}
+	stablePort := port
+	var routed *routeController
+	var directTunnel linkAddr
+	if c.DirectInterface != "" {
+		if *dry {
+			return errors.New("route-based peering does not support dry-run; use the LAN-only dry-run without direct_interface")
+		}
+		if c.DirectInterface == "auto" {
+			owned, e := ensureDirectInterface(client, *name, journalPath+".interface", c.Port, c.DirectListenPort)
+			if e != nil {
+				return e
+			}
+			// Added before the route controller's defer: restore its routes and
+			// peers first, then delete only the interface that we created.
+			defer func() { err = errors.Join(err, owned.Close()) }()
+			c.DirectInterface = owned.Name
+		}
+		routed, err = newRouteController(client, *name, c.DirectInterface, journalPath+".routes", c.Address, c.RouteMetric)
+		if err != nil {
+			return err
+		}
+		defer func() { err = errors.Join(err, routed.RestoreAll()) }()
+		private, port = routed.Identity()
+		if uint16(port) == c.Port {
+			return errors.New("direct WireGuard listen port must differ from the discovery port")
+		}
+		iface, e := net.InterfaceByName(c.DirectInterface)
+		if e != nil {
+			return e
+		}
+		if iface.Flags&net.FlagUp == 0 {
+			return errors.New("direct WireGuard interface must already be up")
+		}
+		directTunnel = linkAddr{Index: iface.Index, Name: iface.Name, Prefix: netip.PrefixFrom(c.Address, c.Address.BitLen())}
+		if err := checkRouteModeRuntime(*name, c, tunnel, stablePort, checkDevice, routed); err != nil {
+			return err
+		}
+		control = routed
+	}
 	n, err := openNetwork(int(c.Port), c.Include, c.Exclude, c.groups(), *name)
 	if err != nil {
 		return err
 	}
 	defer n.Close()
 	m := newMesh(c, n, control, private, uint16(port), tunnel, *dry)
+	m.directTunnel = directTunnel
+	if c.NAT != nil {
+		raw, e := openWireGuardUDP(uint16(port))
+		if e != nil {
+			return e
+		}
+		defer raw.Close()
+		m.enableNAT(raw)
+		defer func() { err = errors.Join(err, m.closeNAT()) }()
+	}
 	m.notify = func() { notify("WATCHDOG=1") }
 	m.verify = func() error {
-		return checkRuntime(*name, c, tunnel, port, checkDevice)
+		if routed != nil {
+			return checkRouteModeRuntime(*name, c, tunnel, stablePort, checkDevice, routed)
+		}
+		return checkRuntime(*name, c, tunnel, stablePort, checkDevice)
 	}
 	// The runtime check includes controller validation and the listen port from
 	// one device read. Mutation preflight calls verify again, not a cached result.

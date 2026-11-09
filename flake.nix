@@ -36,7 +36,7 @@
                   ]
                 );
             };
-            vendorHash = "sha256-2BLFPdWkemykGEcCQGb704+PQJh+0+cARsISvq/9H6Y=";
+            vendorHash = "sha256-tMVVz858VrtYThmTdafY/HEmpWWfYFSe/T6VqK+HnOU=";
             postInstall = ''
               mv "$out/bin/wireguard-mesh" "$out/bin/wireguard-meshd"
             '';
@@ -59,6 +59,10 @@
       checks = nixpkgs.lib.genAttrs [ "x86_64-linux" "aarch64-linux" ] (
         system:
         (import ./tests {
+          pkgs = nixpkgs.legacyPackages.${system};
+          mesh = self.packages.${system}.default;
+        })
+        // (import ./tests/direct.nix {
           pkgs = nixpkgs.legacyPackages.${system};
           mesh = self.packages.${system}.default;
         })

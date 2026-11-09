@@ -589,6 +589,9 @@ func TestControlJournalProtection(t *testing.T) {
 				path = filepath.Join(link, "recovery.json")
 			case "file permissions":
 				err = os.WriteFile(path, []byte("{}"), 0644)
+				if err == nil {
+					err = os.Chmod(path, 0644) // Do not let a restrictive test-runner umask hide the unsafe mode.
+				}
 			case "directory permissions":
 				err = os.Chmod(filepath.Dir(path), 0755)
 			case "blocked write":

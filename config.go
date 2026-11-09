@@ -33,26 +33,41 @@ type peerSpec struct {
 }
 
 type config struct {
-	Address        netip.Addr `json:"address"`
-	Peers          []peerSpec `json:"peers"`
-	Port           uint16     `json:"port"`
-	Multicast4     netip.Addr `json:"multicast4"`
-	Multicast6     netip.Addr `json:"multicast6"`
-	Include        []string   `json:"include"`
-	Exclude        []string   `json:"exclude"`
-	Discovery      duration   `json:"discovery_interval"`
-	BroadcastAfter duration   `json:"broadcast_after"`
-	Probe          duration   `json:"probe_interval"`
-	Window         duration   `json:"latency_window"`
-	Failure        duration   `json:"failure_timeout"`
-	Cooldown       duration   `json:"cooldown"`
-	MinGain        duration   `json:"minimum_gain"`
-	Gain           float64    `json:"minimum_gain_fraction"`
+	Version          int        `json:"version"`
+	Address          netip.Addr `json:"address"`
+	Peers            []peerSpec `json:"peers"`
+	DirectInterface  string     `json:"direct_interface,omitempty"`
+	DirectListenPort uint16     `json:"direct_listen_port,omitempty"`
+	RouteMetric      int        `json:"route_metric"`
+	NAT              *natConfig `json:"nat_traversal,omitempty"`
+	Port             uint16     `json:"port"`
+	Multicast4       netip.Addr `json:"multicast4"`
+	Multicast6       netip.Addr `json:"multicast6"`
+	Include          []string   `json:"include"`
+	Exclude          []string   `json:"exclude"`
+	Discovery        duration   `json:"discovery_interval"`
+	BroadcastAfter   duration   `json:"broadcast_after"`
+	Probe            duration   `json:"probe_interval"`
+	Window           duration   `json:"latency_window"`
+	Failure          duration   `json:"failure_timeout"`
+	Cooldown         duration   `json:"cooldown"`
+	MinGain          duration   `json:"minimum_gain"`
+	Gain             float64    `json:"minimum_gain_fraction"`
+}
+
+// STUN supplies addresses, never peer authorization. Candidates are exchanged
+// through authenticated peer sessions over the existing stable tunnel.
+type natConfig struct {
+	Experimental bool             `json:"experimental"`
+	Servers      []netip.AddrPort `json:"stun_servers"`
+	Refresh      duration         `json:"refresh_interval"`
 }
 
 func defaults() config {
 	return config{
-		Port: 51823, Multicast4: netip.MustParseAddr("239.255.77.77"),
+		Version:     1,
+		RouteMetric: 50,
+		Port:        51823, Multicast4: netip.MustParseAddr("239.255.77.77"),
 		Multicast6: netip.MustParseAddr("ff12::5747:4d53"),
 		Discovery:  duration(time.Minute), BroadcastAfter: duration(5 * time.Minute),
 		Probe: duration(time.Second), Window: duration(15 * time.Second),
@@ -75,8 +90,52 @@ func readConfig(r io.Reader) (config, error) {
 	if d.Decode(new(any)) != io.EOF {
 		return c, errors.New("trailing configuration data")
 	}
+	if c.Version != 1 && c.Version != 2 {
+		return c, errors.New("configuration version must be 1 or 2")
+	}
+	if c.Version == 2 {
+		// Preserve old configurations. Version 2 makes the dedicated interface
+		// automatic by default; an explicit empty name selects legacy mode.
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(body, &fields); err != nil {
+			return c, errors.New("invalid configuration JSON")
+		}
+		name, explicit := fields["direct_interface"]
+		if !explicit {
+			c.DirectInterface = "auto"
+		} else if bytes.Equal(bytes.TrimSpace(name), []byte("null")) {
+			return c, errors.New("direct_interface must be a name, auto, or an empty string")
+		}
+	}
+	if c.RouteMetric < 0 || c.RouteMetric > 1<<30 || c.DirectInterface != "" && !validName(c.DirectInterface) {
+		return c, errors.New("invalid direct_interface or route_metric")
+	}
+	if c.DirectListenPort != 0 && (c.DirectInterface != "auto" || c.DirectListenPort == c.Port) {
+		return c, errors.New("direct_listen_port requires an automatic interface and must differ from the discovery port")
+	}
+	if c.NAT != nil {
+		if !c.NAT.Experimental {
+			return c, errors.New("NAT traversal is experimental; set nat_traversal.experimental to true explicitly")
+		}
+		if c.NAT.Refresh == 0 {
+			c.NAT.Refresh = duration(20 * time.Second)
+		}
+		if c.DirectInterface == "" || len(c.NAT.Servers) == 0 || len(c.NAT.Servers) > 4 || c.NAT.Refresh < duration(time.Second) || c.NAT.Refresh > duration(time.Minute) {
+			return c, errors.New("NAT traversal requires direct_interface, 1–4 IPv4 STUN servers, and a refresh interval of 1s–1m")
+		}
+		seen := make(map[netip.AddrPort]bool)
+		for _, server := range c.NAT.Servers {
+			if !server.IsValid() || !server.Addr().Is4() || !server.Addr().IsGlobalUnicast() || server.Addr().IsLoopback() || server.Port() == 0 || seen[server] {
+				return c, errors.New("invalid or duplicate IPv4 STUN server")
+			}
+			seen[server] = true
+		}
+	}
 	if !overlayAddress(c.Address) || len(c.Peers) == 0 || len(c.Peers) > 128 || c.Port < 1024 {
 		return c, errors.New("set a tunnel address, 1–128 peers, and an unprivileged UDP port")
+	}
+	if c.DirectInterface != "" && !c.Address.Is4() {
+		return c, errors.New("route-based peering currently requires IPv4 tunnel addresses")
 	}
 	if !c.Multicast4.Is4() || !c.Multicast4.IsMulticast() || !c.Multicast6.Is6() || !c.Multicast6.IsLinkLocalMulticast() || c.Multicast6.Zone() != "" {
 		return c, errors.New("set an IPv4 multicast group and an IPv6 link-local multicast group")
@@ -92,6 +151,9 @@ func readConfig(r io.Reader) (config, error) {
 	adapter := false
 	for i := range c.Peers {
 		p := &c.Peers[i]
+		if c.DirectInterface != "" && (p.RosenpassSocket != "" || p.ExperimentalRekey) {
+			return c, errors.New("route-based peering does not support the Rosenpass adapter or experimental in-place rekey")
+		}
 		var err error
 		p.key, err = wgtypes.ParseKey(p.PublicKey)
 		if err != nil || p.key == (wgtypes.Key{}) || keys[p.key] || ips[p.IP] || !overlayAddress(p.IP) || p.IP.Is4() != c.Address.Is4() {

@@ -1,8 +1,8 @@
 # wireguard-mesh
 
-`wireguard-meshd` is a small Linux Go service for direct LAN paths between trusted WireGuard nodes. See [PLAN.md](PLAN.md) for the design.
+`wireguard-meshd` is a Linux Go service for direct LAN pairing between trusted WireGuard nodes. New version 2 configurations use an automatically owned direct WireGuard interface and establish the handshake before moving traffic. Optional IPv4 NAT traversal uses Pion ICE and is experimental. See [NAT.md](NAT.md) for setup and [PLAN.md](PLAN.md) for the original LAN design.
 
-**Status:** Go and QEMU/KVM tests cover relay and LAN operation, recovery, separate NAT networks, Rosenpass, and IPv6 UDP transport. The experimental rekey completion check failed with both the original 90-second observation limit and the current 150-second limit. With 150 seconds, another Rosenpass key arrived before observation completed, and the daemons restored the relay path. In-place rekey is not production-ready; a handshake timestamp does not prove which PSK established it. See [tests/README.md](tests/README.md) for commands and limits. An independent security review is still required before production use.
+**Status:** All 18 `x86_64-linux` QEMU checks pass, including eleven LAN/NAT profiles and seven existing regression checks. Go tests, race checks, vet, and fuzz checks also pass. See [tests/README.md](tests/README.md) for measurements and limits. Hole punching and in-place rekey remain experimental; a handshake timestamp does not prove which PSK established it. An independent security review is still required before production use.
 
 Wireguard is an incredible VPN. One issue is that peers and routes are statically defined.
 
@@ -26,7 +26,7 @@ The problem is that if B & C want to pass data over the wireguard VPN, they need
 
 That example can extend to another scenario where B and C are on separate LANs.
 
-Nodes on separate LANs would need NAT traversal. Hole punching is not supported and is not an implementation goal. DERP is a relay mechanism, not hole punching.
+Nodes on separate LANs need NAT traversal. The optional mode in [NAT.md](NAT.md) exchanges authenticated endpoints over the stable tunnel and attempts hole punching on the actual WireGuard port. It keeps the existing hub route as fallback. DERP is a relay mechanism, not hole punching.
 
 ---
 ## Usage
@@ -54,7 +54,9 @@ Pass the name of one existing WireGuard configuration/interface:
 wireguard-meshd -wireguard wg0 -config /etc/wireguard-mesh/wg0.json
 ```
 
-`wg0` is the interface created by your existing WireGuard setup, not a path to a `.conf` file. The daemon does not execute `wg-quick`, create interfaces, or change persistent WireGuard configuration.
+`wg0` is the stable interface created by your existing WireGuard setup, not a path to a `.conf` file. The daemon does not execute `wg-quick` or change persistent WireGuard configuration.
+
+Version 2 creates a separate, owned direct interface and temporary host routes. The stable interface's peer configuration stays unchanged. Name conflicts are handled without adopting unrelated interfaces. Compatible reverse-path filtering is required; the daemon does not change sysctls or firewall policy. Configurations without a version retain legacy behavior. See [NAT.md](NAT.md).
 
 The known default discovery address is **`239.255.77.77:51823`**. IPv6 discovery uses **`[ff12::5747:4d53]:51823`**. These are multicast destination addresses; do not assign them to an interface. This daemon port is separate from the WireGuard listen port. All participating nodes must use the same daemon port and compatible multicast groups.
 
@@ -62,6 +64,7 @@ Copy [example.json](example.json) and replace its public-key placeholder. For no
 
 ```json
 {
+  "version": 2,
   "address": "10.77.0.2",
   "peers": [
     {"public_key": "C_WIREGUARD_PUBLIC_KEY", "ip": "10.77.0.3"}
@@ -88,6 +91,7 @@ All JSON settings other than `address` and `peers` have defaults:
 
 | Setting | Default | Function |
 |---|---|---|
+| `version` | `1` for existing files; example uses `2` | Version 2 defaults to automatic route mode; version 1 retains legacy behavior |
 | `port` | `51823` | Multicast, broadcast, and authenticated unicast UDP port |
 | `multicast4` | `239.255.77.77` | IPv4 multicast group |
 | `multicast6` | `ff12::5747:4d53` | IPv6 link-local multicast group |
@@ -101,6 +105,10 @@ All JSON settings other than `address` and `peers` have defaults:
 | `cooldown` | `"30s"` | Delay before another performance-driven switch |
 | `minimum_gain` | `"2ms"` | Minimum absolute RTT improvement |
 | `minimum_gain_fraction` | `0.2` | Minimum relative improvement; `0.2` means 20% |
+| `direct_interface` | `"auto"` in version 2; unset in version 1 | Automatic owned interface, explicit existing interface name, or empty string for legacy mode |
+| `direct_listen_port` | `0` | Kernel-selected free port for automatic interfaces; an explicit port must differ from stable and discovery ports |
+| `route_metric` | `50` | Metric for temporary direct host routes; lower wins between equal prefixes |
+| `nat_traversal` | unset | Experimental Pion ICE/STUN traversal; requires `experimental: true` and authenticated stable-tunnel signaling |
 
 The default interface policy selects addressed physical devices that are up. It excludes the managed WireGuard interface and other virtual devices. Netlink events and periodic refresh handle interface changes. Multicast TTL/hop limit is one. IPv4 broadcast uses the directly attached subnet; IPv6 has no broadcast.
 
@@ -229,7 +237,7 @@ go test -run='^$' -fuzz=FuzzSecureInnerReceive -fuzztime=30s -parallel=2 .
 
 `path:.` includes new files in an uncommitted checkout. Alternatively, use Go 1.26 and a C compiler without Nix. The race detector requires cgo; a host with no C compiler can disable it by default.
 
-Tests include strict configuration parsing, whole-packet privacy, KDF vectors, malformed envelopes, replay rejection, entropy failures, receive-work limits, fake-clock path selection, broadcast fallback, dry run, one-way loss, blocked WireGuard traffic, separate-LAN safety, journal recovery, and real loopback UDP transport. The separate-LAN test asserts no unsafe route change; it does not implement hole punching. The shared-LAN VM test captures multicast, broadcast, and unicast packets and checks their size and absence of plaintext identities.
+Tests include strict configuration parsing, whole-packet privacy, KDF vectors, malformed envelopes, replay rejection, entropy failures, receive-work limits, fake-clock path selection, broadcast fallback, dry run, one-way loss, blocked WireGuard traffic, separate-LAN safety, journal recovery, and real loopback UDP transport. The original `nat` check still asserts no unsafe route change under a relay-only firewall. Separate `same-lan-routes` and `nat-traversal` VM checks exercise the new opt-in modes. See [tests/README.md](tests/README.md) for their measurements and executed results. The shared-LAN privacy check applies to the default discovery protocol, not plaintext STUN binding packets.
 
 An additional Linux network-namespace test uses real kernel WireGuard and a three-node topology. It is skipped unless explicitly enabled. On a disposable Linux test machine with `ip`, `wg`, `tc`, `sysctl`, and `ping` installed:
 
