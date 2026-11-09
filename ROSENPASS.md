@@ -4,7 +4,7 @@ Rosenpass negotiates a PSK. `wireguard-meshd` remains the only writer of direct 
 
 This adapter supports Rosenpass **0.2.3**, with one mesh peer and one child process per node. Keep hub Rosenpass separate. Use separate mesh keys, output paths, listening ports, and service accounts. More peers will require additional design work; per-peer processes need distinct ports.
 
-## Mesh Configuration
+## Legacy LAN Configuration
 
 On B, configure the approved C peer:
 
@@ -23,9 +23,52 @@ On B, configure the approved C peer:
 
 On C, use C's tunnel address and B's peer identity. No LAN endpoint is configured here. The lower WireGuard public key selects a confirmed LAN address pair. It reports the choice through the authenticated LAN channel. Each daemon gives its adapter the remote address and the receiving local interface. This happens before the first PSK exists.
 
-Permit discovery, WireGuard, and the mesh Rosenpass UDP port on participating LANs. Rosenpass needs a reachable address to exchange keys. No NAT traversal is provided. A healthy Rosenpass endpoint is retained even if a WireGuard path trial selects another LAN.
+In legacy mode, permit discovery, WireGuard, and the mesh Rosenpass UDP port on participating LANs. That adapter mode does not provide NAT traversal. A healthy Rosenpass endpoint is retained even if a WireGuard path trial selects another LAN.
 
 `-dry-run` does not contact the adapter or start its child. It still performs ordinary discovery and measurements.
+
+## Direct-Interface Configuration
+
+Rosenpass on automatic LAN and experimental NAT direct paths passed the
+`x86_64-linux` QEMU checks. For route mode, add `"version": 2` to the mesh
+configuration above. Keep the PSK-file and adapter socket settings. Do not
+enable `experimental_in_place_rekey`.
+
+Add both fields to B's adapter configuration below:
+
+```json
+"tunnel_interface": "wg0",
+"tunnel_peer_ip": "10.77.0.3"
+```
+
+On C, use B's tunnel IP. The adapter permits only the named kernel WireGuard
+interface, an assigned source address, and that exact remote tunnel address.
+Omitting both fields retains the legacy LAN behavior.
+
+Rosenpass exchanges run inside the VPN. At first they use the hub. Normal OS
+routing can then carry them over an active direct WireGuard path. Permit the
+Rosenpass UDP port between the peers inside the VPN; a separate public port or
+NAT mapping is not needed. Keep the hub's keys and mesh keys separate.
+
+VPN mode uses a fixed initial role: compare the complete raw Rosenpass public
+key files as unsigned byte sequences. Only the lower identity gets an initial
+endpoint. The other process listens and learns its authenticated peer endpoint.
+Equal identities are rejected. This avoids competing initial exchanges that
+can leave different current keys on the two nodes. No extra setting is needed.
+
+This policy changes startup, not Rosenpass's later rekey behavior. After an
+exchange, either process can initiate another one. Key-possession checks remain
+mandatory. Restarting only the initial listener can require the other process's
+native rekey timer, up to about 130 seconds. The hub remains in use while the
+new key is unavailable. See the [v0.2.3 protocol timers](https://github.com/rosenpass/rosenpass/blob/v0.2.3/rosenpass/src/protocol.rs).
+
+Both automatic LAN and experimental hole-punched paths use the resulting PSK.
+A configured Rosenpass peer cannot get a direct route without fresh adapter
+status and a matching file. Invalid status, missing output, and expiry restore
+the hub. Key rotation removes the old direct peer and requires a newly staged
+peer, handshake, and traffic trial. This is not the experimental PSK-only update.
+
+See [NAT.md](NAT.md) for LAN-first timing, NAT enablement, and route prerequisites.
 
 ## Adapter Configuration
 
@@ -101,7 +144,7 @@ After an exchanged event, the adapter validates the raw file and publishes a com
 - Child exit, endpoint change, lost stdout, and expiry also invalidate output.
 - Missing or unsafe output returns the direct peer to the stable hub path. Recovery conflicts stop changes and retain the journal.
 
-The stdout event and raw file are not one atomic record. Both nodes therefore confirm key possession independently. Confirmation uses HMACs bound to the operation, transaction token, and sender and receiver identities. Only these proofs cross the authenticated LAN control channel. Neither the PSK nor its unkeyed hash is sent through discovery.
+The stdout event and raw file are not one atomic record. Both nodes therefore confirm key possession independently. Confirmation uses HMACs bound to the operation, transaction token, and sender and receiver identities. Only these proofs cross the authenticated LAN or ICE-selected control path. Neither the PSK nor its unkeyed hash is sent through discovery.
 
 The file checks remain mandatory: canonical nonzero base64, optional final newline, regular file, trusted owner, and restricted permissions. Symlinks, group write, world access, executable bits, and special permission bits are rejected. File age defaults to `3m`; `preshared_key_max_age` permits `130s` through `3m`. The adapter also expires an exchange within three minutes, independently of later file timestamps.
 
@@ -109,7 +152,7 @@ Static `preshared_key` remains supported. It cannot be combined with `preshared_
 
 ## Experimental Rekey
 
-The default policy restores the hub and repeats the direct trial when the key changes. To test PSK-only updates, set `experimental_in_place_rekey` to `true` for the peer on **both** nodes. This requires `preshared_key_file`; it is disabled by default.
+The default policy restores the hub and repeats the direct trial when the key changes. To test PSK-only updates in **legacy mode**, set `experimental_in_place_rekey` to `true` for the peer on **both** nodes. This requires `preshared_key_file`; it is disabled by default and rejected in route mode.
 
 Both nodes must advertise support and confirm the new key before either updates WireGuard. The controller journals the old and new hashes before the update. It reads back the installed peer and hash before completing the local transaction. Recovery accepts only the expected hashes, not an unrelated key. A successful PSK-only update retains the peer, endpoint, and AllowedIPs.
 
@@ -119,7 +162,7 @@ New performance-driven path changes wait for 150 seconds after local completion 
 
 **This is not verified new-PSK handshake protection.** Existing WireGuard transport keys survive a PSK update. An old pending session can also produce a newer `LastHandshakeTime`. The experimental path requires later handshake observations at both nodes, not traffic alone. Its logs explicitly state that the PSK generation remains unverified. The current WireGuard API exposes no handshake-to-PSK generation identifier. Do not enable this experiment in production. Zero packet loss is not promised.
 
-Fallback retains the existing hub configuration. Protect and monitor those hub links separately if the deployment requires post-quantum protection during fallback. Mesh Rosenpass does not protect discovery, validate hub Rosenpass status, or add end-to-end post-quantum protection.
+Fallback retains the existing hub configuration. Protect and monitor those hub links separately if the deployment requires post-quantum protection during fallback. Mesh Rosenpass protects the direct WireGuard relationship. It does not validate hub Rosenpass status or provide B-to-C end-to-end protection while the hub relays traffic. Discovery still uses the separate Noise protocol.
 
 ## Verification
 
@@ -143,6 +186,15 @@ WGMESH_REKEY_TEST=1 go test -run '^TestLinuxPSKRekey$' -count=1 -v -timeout=6m
 It creates and removes isolated network namespaces. It demonstrates working old transport after a PSK mismatch and a post-update timestamp from an old pending key. A separate case blocks handshakes until old transport keys expire, then observes a fresh handshake with matching new PSKs. That controlled experiment preserves endpoints and AllowedIPs. Its timing assumptions are not a production verification guarantee.
 
 The QEMU suite has separate `rosenpass`, `rosenpass-adapter`, and `rosenpass-rekey` checks. The first covers file-only mode through the relay. The adapter check covers LAN discovery before a key exists, socket restrictions, natural rekey without child restart, PSK reuse, endpoint changes, process failure, and expiry despite fresh file timestamps. The rekey check covers PSK-only peer preservation and bounded fallback when new handshakes are blocked but old direct transport still works. Independent hub PSKs must remain unchanged. See [tests/README.md](tests/README.md) for commands.
+
+The route-mode checks are `same-lan-rosenpass-routes` and
+`nat-traversal-rosenpass`. Both passed with real Rosenpass VPN exchange, no
+direct route without valid adapter status, installed-key checks, and recovery
+after adapter restart. The LAN case also passed listener-only restart. The NAT
+case recorded old-peer removal, hub fallback, and a handshake with the matching
+new key before route return during natural rotation. The initial role order
+was opposite in the two profiles. All 22 QEMU checks passed on the final source;
+see the [results and limits](tests/README.md#results-and-limits).
 
 The `same-lan` check also recreates the WireGuard interface while an active journal remains. Correct baseline recovery retains an empty journal file. Conflicting ownership leaves the original journal unchanged and stops recovery.
 

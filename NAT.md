@@ -43,8 +43,23 @@ The tunnel IP stays on the stable interface. Both receive paths remain valid
 while the nodes switch routes at different times. Shutdown and crash recovery
 remove managed routes and peers before deleting the owned interface.
 
-Normal LAN discovery is preferred when both LAN and ICE candidates qualify.
-An experimental ICE candidate cannot replace an active healthy LAN path.
+LAN discovery gets an initial opportunity before ICE starts. An experimental
+ICE candidate cannot replace an active healthy LAN path. While NAT is active,
+new LAN candidates are compared with fresh hub measurements, not only the
+current NAT path's RTT.
+
+A failed LAN trial delays another attempt on that path for at least two minutes.
+ICE also excludes failed on-link IPs during that delay. Control replies alone
+cannot make a failed WireGuard path usable again. A new LAN candidate can
+qualify after a link cycle. If the bounded list of failed LAN IPs is full, new
+NAT qualification pauses until the failure windows expire. A healthy active
+NAT route and normal LAN qualification remain available.
+
+During a normal LAN trial or active path, the daemon checks the kernel
+WireGuard endpoint. If it roams back to WAN, the daemon corrects it and requires
+new trial measurements. Continued roaming fails the LAN attempt. NAT paths
+retain normal endpoint roaming so that a changed public port can work. These
+are periodic checks, not a firewall rule or a general flood defense.
 
 ### Compatibility and prerequisites
 
@@ -60,8 +75,10 @@ An experimental ICE candidate cannot replace an active healthy LAN path.
 - The first route mode supports IPv4 tunnel host routes in the main table.
   Policy routing, multipath, nonzero direct-interface firewall marks, and
   default-route changes are unsupported.
-- The Rosenpass adapter and experimental in-place rekey require legacy mode.
-  Static PSKs and PSK files retain possession checks and hub fallback on changes.
+- The Rosenpass adapter supports route mode through an explicitly configured
+  VPN exchange. Experimental in-place rekey still requires legacy mode.
+  Route mode restores the hub and removes the old direct peer on a key change;
+  the new peer needs a new handshake and traffic trial.
 - Route mode does not support `-dry-run`. The legacy mode retains its IPv6 and
   dry-run support.
 
@@ -78,13 +95,18 @@ Enable it only when needed:
 "nat_traversal": {
   "experimental": true,
   "stun_servers": ["198.51.100.10:3478", "203.0.113.10:3478"],
-  "refresh_interval": "20s"
+  "refresh_interval": "20s",
+  "lan_first_timeout": "30s"
 }
 ```
 
 Use route mode and one to four IPv4 STUN endpoints. The refresh interval
 controls authenticated signaling and must be between 1 second and 1 minute.
 The NAT underlay must be eligible under the `include` and `exclude` policy.
+`lan_first_timeout` gives normal LAN discovery and qualification time before
+ICE starts. It defaults to the greater of 30 seconds and the measurement window
+plus two probe intervals. An explicit value must allow that measurement window
+and must not exceed ten minutes. LAN discovery continues after NAT fallback.
 
 The implementation uses pinned [Pion ICE](https://github.com/pion/ice) and
 [Pion STUN](https://github.com/pion/stun) libraries for gathering, STUN
@@ -119,6 +141,41 @@ AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
 The base LAN service does not grant the extra capability. STUN/ICE packets are
 not private discovery envelopes: they expose transport addresses and protocol
 metadata. Limits and authenticated checks do not provide general flood defense.
+
+## Rosenpass-protected direct paths
+
+WireGuard carries the tunnel traffic. Rosenpass supplies post-quantum-derived
+preshared keys. When a peer has `rosenpass_socket` and `preshared_key_file`,
+both LAN and hole-punched direct routes require a fresh, adapter-confirmed key.
+A file alone cannot authorize a route. Existing configurations without these
+settings keep their behavior; this does not silently enable Rosenpass for them.
+
+For route mode, configure the adapter with both of these fields:
+
+```json
+"tunnel_interface": "wg0",
+"tunnel_peer_ip": "10.77.0.3"
+```
+
+Use the actual stable WireGuard interface and the remote peer's tunnel IP.
+The mesh peer also needs its normal Rosenpass socket and PSK file settings.
+Keep `experimental_in_place_rekey` disabled in route mode.
+
+The adapter checks the configured WireGuard interface, assigned source address,
+and exact remote tunnel address. Rosenpass exchanges use the existing VPN,
+including its direct route when active. They do not need a separate public UDP
+port or NAT mapping. Permit the configured Rosenpass UDP port between the peers
+inside the VPN; the examples and tests use `51822`.
+
+Omitting both adapter fields preserves the legacy on-link LAN exchange.
+Do not use the legacy adapter configuration for a new route-mode peer.
+
+If a key changes, the adapter fails, or the key expires, the daemon restores the
+hub route. A changed key requires removal of the old direct peer, a newly staged
+peer, and another WireGuard handshake and trial. This can interrupt direct
+traffic briefly. It avoids treating an old WireGuard transport session as proof
+of a new key. A continued loss of the VPN exchange path eventually expires the
+key and prevents direct operation, even when ICE checks still succeed.
 
 ## STUN service
 

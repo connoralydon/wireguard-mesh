@@ -94,9 +94,8 @@ func checkPSKProof(key wgtypes.Key, msg message, sender, receiver wgtypes.Key) b
 	return hmac.Equal([]byte(msg.Proof), []byte(pskProof(key, msg.Op, msg.Token, sender, receiver)))
 }
 
-// Reporting a confirmed LAN path must not depend on having a PSK: Rosenpass
-// needs this address to obtain the first key. Retain a healthy endpoint to avoid
-// restarting exchanges merely because map iteration or RTT measurements change.
+// Route mode exchanges Rosenpass keys inside the existing VPN, before direct
+// discovery can depend on a key. Legacy mode retains its on-link LAN exchange.
 func (m *mesh) readPeerPSK(p *meshPeer, now time.Time) (wgtypes.Key, rosenpassResponse, error) {
 	started := time.Now()
 	if p.spec.RosenpassSocket == "" {
@@ -106,34 +105,39 @@ func (m *mesh) readPeerPSK(p *meshPeer, now time.Time) (wgtypes.Key, rosenpassRe
 	if m.dry {
 		return wgtypes.Key{}, rosenpassResponse{}, errPSKFile
 	}
-	fresh := func(c *path) bool { return c != nil && slices.Contains(m.links, c.link) && m.fresh(c, now) }
-	c := p.rosenpassPath
-	known := c != nil
-	leader := bytes.Compare(m.public[:], p.spec.key[:]) < 0
-	if !fresh(c) {
-		c = nil
-		if leader {
-			for _, candidate := range p.paths {
-				if fresh(candidate) && (c == nil || pathName(candidate.link, candidate.addr) < pathName(c.link, c.addr)) {
-					c = candidate
-				}
-			}
-			p.rosenpassToken = rand.Text()
-		}
-	}
-	p.rosenpassPath = c
-	if c == nil && !known {
-		// At startup there is no endpoint decision yet. Do not destroy a live
-		// adapter's existing exchange before discovery can confirm its LAN.
-		return wgtypes.Key{}, rosenpassResponse{}, errPSKFile
-	}
 	request := rosenpassRequest{Peer: p.spec.key.String()}
-	if c != nil {
-		request.Address, request.Link = c.addr.Addr(), c.link
-		if leader {
-			// The follower uses the receiving interface for this authenticated
-			// message. Local interface ordering need not agree between nodes.
-			m.send(c.session, message{Op: "rosenpass-select", Token: p.rosenpassToken, Port: m.wgPort}, c.addr, c.link, now)
+	if m.c.DirectInterface != "" {
+		// The adapter must explicitly permit this VPN interface and peer IP.
+		// Use the stable address identity; normal OS routing can carry later
+		// exchanges over an already-active direct WireGuard path.
+		request.Address, request.Link = p.spec.IP, m.tunnel
+	} else {
+		fresh := func(c *path) bool { return c != nil && slices.Contains(m.links, c.link) && m.fresh(c, now) }
+		c := p.rosenpassPath
+		known := c != nil
+		leader := bytes.Compare(m.public[:], p.spec.key[:]) < 0
+		if !fresh(c) {
+			c = nil
+			if leader {
+				for _, candidate := range p.paths {
+					if fresh(candidate) && (c == nil || pathName(candidate.link, candidate.addr) < pathName(c.link, c.addr)) {
+						c = candidate
+					}
+				}
+				p.rosenpassToken = rand.Text()
+			}
+		}
+		p.rosenpassPath = c
+		if c == nil && !known {
+			// Retain a live legacy exchange until discovery has an endpoint.
+			return wgtypes.Key{}, rosenpassResponse{}, errPSKFile
+		}
+		if c != nil {
+			request.Address, request.Link = c.addr.Addr(), c.link
+			if leader {
+				// The follower uses its receiving interface for this message.
+				m.send(c.session, message{Op: "rosenpass-select", Token: p.rosenpassToken, Port: m.wgPort}, c.addr, c.link, now)
+			}
 		}
 	}
 	before, err := m.rosenpass(p.spec.RosenpassSocket, request)

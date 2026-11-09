@@ -6,7 +6,7 @@ These tests use the NixOS test driver, QEMU/KVM, real kernel WireGuard, and the 
 
 These are full VM integration tests, not mocked network tests or containers. The NixOS test driver starts QEMU directly; it does not use libvirt.
 
-1. [The flake](../flake.nix) builds the Go daemon and exposes seven original regression checks and eleven route/NAT profiles, for 18 checks total. [default.nix](default.nix), [direct.nix](direct.nix), and [ipv6.nix](ipv6.nix) use `pkgs.testers.runNixOSTest`. Their `qemu.forceAccel = true` setting requires KVM hardware acceleration.
+1. [The flake](../flake.nix) builds the Go daemon and exposes seven original regression checks and fifteen route/NAT profiles, for 22 checks total. [default.nix](default.nix), [direct.nix](direct.nix), and [ipv6.nix](ipv6.nix) use `pkgs.testers.runNixOSTest`. Their `qemu.forceAccel = true` setting requires KVM hardware acceleration.
 2. The driver starts three guests for the relay-only, shared-LAN, and Rosenpass cases: relay A and nodes B and C. The NAT case adds two router guests. Each guest has its own Linux kernel, interfaces, WireGuard state, and systemd services.
 3. The guests connect through isolated virtual Ethernet networks. The `vlan` numbers in the test configuration identify these test networks; they do not configure VLANs on the host's physical network. Initially, B and C have only A as their WireGuard peer. A forwards their tunnel traffic.
 4. [base.py](base.py) controls the guests through the Python test driver. Commands such as `b.succeed("ip link set lan down")` run inside guest B. [guest.py](guest.py) creates the real WireGuard interfaces, test keys, routes, and NAT rules. Setup commands run as root inside the guests; the mesh daemon runs through its non-root systemd service.
@@ -135,6 +135,14 @@ nix build --no-link --print-out-paths -L --max-jobs 1 --builders '' \
   path:.#checks.x86_64-linux.same-lan-routes
 nix build --no-link --print-out-paths -L --max-jobs 1 --builders '' \
   path:.#checks.x86_64-linux.nat-traversal
+nix build --no-link --print-out-paths -L --max-jobs 1 --builders '' \
+  path:.#checks.x86_64-linux.same-lan-rosenpass-routes
+nix build --no-link --print-out-paths -L --max-jobs 1 --builders '' \
+  path:.#checks.x86_64-linux.nat-traversal-rosenpass
+nix build --no-link --print-out-paths -L --max-jobs 1 --builders '' \
+  path:.#checks.x86_64-linux.lan-first-nat-fallback
+nix build --no-link --print-out-paths -L --max-jobs 1 --builders '' \
+  path:.#checks.x86_64-linux.lan-first-wg-blocked
 ```
 
 `--builders ''` keeps these runs on the local KVM host. An unchanged successful
@@ -147,7 +155,11 @@ See [NAT.md](../NAT.md) for production configuration and limits.
 | `same-lan-routes` | Compare default in-place peering and separate-interface route peering on the same three guests, with three repetitions and alternating order. Check direct handshakes, host routes, traffic counters, and unchanged stable configuration in route mode. Exercise silent one-way and two-way failure, LAN loss, daemon death, restart, and stop. |
 | `same-lan-auto` | Use automatic interface naming and a kernel-selected port. Check a conflicting foreign interface remains unchanged, direct traffic works, and recovery after a one-way outage, daemon kill, restart, and stop removes only the owned interface. |
 | `same-lan-stun-down` | Enable experimental traversal with an unavailable STUN server. Require a healthy direct LAN path and unchanged daemon processes over 35 seconds. |
+| `same-lan-rosenpass-routes` | Exchange real Rosenpass keys inside the VPN. Require valid adapter status and a matching installed PSK before direct routing. Reject orphan output, recover after both adapters restart, and recover after only the initial listener restarts. Keep mesh daemon PIDs unchanged. |
+| `lan-first-nat-fallback` | Start on LAN without outbound ICE/STUN. Fall back to NAT after LAN loss, then return to a slower LAN path using fresh hub measurements. Require the correct kernel endpoint, increasing LAN WireGuard transport counters, and unchanged WAN transport counters during the LAN measurement. |
+| `lan-first-wg-blocked` | Keep LAN control usable but block LAN WireGuard packets. Require a WAN direct path instead of the failed LAN host candidate. Remove the block and cycle the LAN; require return to LAN with the same endpoint and transport-counter checks. |
 | `nat-traversal` | Use Coturn STUN on A, peers B/C, and two NAT routers. Use Pion ICE to select a direct candidate without configured peer endpoints or inbound forwarding. Check translated ports, blocked direct UDP, mapping changes, STUN and signaling loss, daemon death, restart, and stop. |
+| `nat-traversal-rosenpass` | Apply the Rosenpass status and installed-key checks through two NAT routers. During natural rotation, record old-peer removal, hub fallback, and a handshake with the matching new key before route return. Reject orphan output and recover after adapter restart without restarting the mesh daemons. |
 | `nat-traversal-port-preserving` | Both routers preserve direct port `51821`; require direct WireGuard traffic. |
 | `nat-traversal-blocked` | Block peer-bound direct UDP. Require the stable relay, no direct host route, and running daemons. |
 | `nat-traversal-wg-blocked` | Permit ICE selection but drop peer-bound WireGuard packets. Require packet-drop evidence, no WireGuard handshake or direct host route during the watch, and a usable relay. |
@@ -208,7 +220,7 @@ Assertions check peer sets, `AllowedIPs`, LAN endpoint addresses, recent handsha
 
 Go tests separately check the directional X25519/HKDF derivation, envelope tampering, encrypted length and padding, identity binding before state changes, replay protection, expiry, entropy failures, and plaintext-version rejection. The 128-peer load test accepts 512 valid data packets and rejects 256 unaddressed frames per simulated second within the decryption-attempt budget. It is not a flood-resistance or maximum-rate benchmark. `FuzzSecureReceive` tests public wire packets; `FuzzSecureInnerReceive` tests the inner Noise parser.
 
-The adapter cases reject Rosenpass UDP traffic through `wg0` and the WAN. No test command supplies an authorized endpoint to the adapter. Initial exchange therefore requires mesh discovery to provide the LAN address. These cases use independent, nonzero test PSKs on the hub links and verify that mesh changes do not replace them.
+The legacy adapter cases reject Rosenpass UDP traffic through `wg0` and the WAN. No test command supplies an authorized endpoint to the adapter. Initial exchange therefore requires mesh discovery to provide the LAN address. The route-mode adapter cases instead require Rosenpass exchange inside the VPN. These cases use independent, nonzero test PSKs on the hub links and verify that mesh changes do not replace them.
 
 [adapter_guest.py](adapter_guest.py) compares output and installed keys inside each guest. It checks both adapter and child UIDs and capability sets. A second account has socket group access but must fail the UID check. Failure tests compare mesh daemon PIDs to prevent automatic service restart from concealing a daemon exit. Received Rosenpass packets are dropped on both guests to simulate a network outage without returning local send errors.
 
@@ -216,7 +228,150 @@ The adapter cases reject Rosenpass UDP traffic through `wg0` and the WAN. No tes
 
 ## Results And Limits
 
-### Current LAN And NAT Results
+### Current Rosenpass And LAN-First Results
+
+All **22 QEMU checks passed** on `x86_64-linux` in one complete sequential local
+KVM run on 9 November 2026. This includes all fifteen route/NAT profiles and all
+seven original regression checks. Every log contains an executed VM test script;
+these were not only cached results. Total QEMU build elapsed time was
+4,651.506 seconds, about 77.5 minutes.
+
+The build-input manifest ID is
+`fdf89f93c211cc9645cf2d8bd905dce01ee4adaaac989817b8468f5d163afa89`.
+It identifies SHA-256 hashes of 73 build-input files, not a Git commit. All
+inputs stayed unchanged through the run. Documentation is outside this manifest.
+The previous `a58ffdd` results below are historical, not the measurements for
+this revision.
+
+Both Rosenpass profiles rejected direct routing without valid adapter status
+and rejected orphan output. They recovered with a new installed key after both
+adapters restarted, without restarting the mesh daemons. The LAN profile also
+passed listener-only restart. During natural NAT rekey, both nodes recorded
+`peer_absent`, `relay_seen`, `new_handshake_before_route`, and
+`new_key_installed` as true.
+
+The profiles checked process arguments inside the guests and found exactly one
+initial initiator: B in the LAN case, C in the NAT case. Only role booleans were
+exported. PSKs and private keys stayed inside the guests.
+
+The four new profiles, full LAN/NAT comparisons, and 660-second outage each
+retained TCP connection 1 in both directions, with traffic after the faults.
+The route monitor required a handshake and then a hub-route observation before
+direct promotion; a handshake first seen after the route change did not pass.
+
+The [test-only observer](observer/main.go) keeps kernel clients open and reads
+WireGuard state before each route lookup. It starts before the daemon and does
+not run `wg` or `ip` subprocesses. This removes process-start delays from the
+short pre-route observation interval without changing daemon timing. Rekey
+observations also require the same new PSK in the file and kernel snapshot.
+The observer exports only result booleans and a route-observation timestamp.
+
+#### Measurements
+
+The fresh LAN comparison used three repetitions per mode with alternating
+order. UDP counts combine both directions. Activation includes discovery,
+qualification, WireGuard handshake, and trial confirmation.
+
+| Measurement | Legacy in-place mode | Automatic-interface route mode |
+|---|---:|---:|
+| Median confirmed activation | 11.114 s | 11.737 s |
+| Missing activation UDP replies | 23 / 2,970 | 10 / 3,127 |
+| Longest activation no-reply interval, range | 30–89 ms | 29–32 ms |
+| Steady direct median RTT, range | 1.170–1.221 ms | 1.092–1.243 ms |
+
+Route mode had fewer missing activation replies in this sample. These short
+VM runs do not establish a general speed or reliability advantage.
+
+Both LAN-first profiles returned from NAT to LAN even though LAN had the higher
+RTT. These are round-trip measurements through the tunnel:
+
+| Profile | Node | NAT RTT | LAN RTT |
+|---|---|---:|---:|
+| `lan-first-nat-fallback` | B | 5.624 ms | 21.638 ms |
+| `lan-first-nat-fallback` | C | 5.352 ms | 21.494 ms |
+| `lan-first-wg-blocked` | B | 2.588 ms | 21.496 ms |
+| `lan-first-wg-blocked` | C | 2.462 ms | 22.458 ms |
+
+During each LAN measurement, LAN WireGuard transport counters increased and
+WAN transport counters stayed unchanged. Both blocked-LAN nodes counted a
+dropped handshake initiation. LAN control replies did not authorize that
+blocked WireGuard path. Removing the block and cycling the LAN permitted
+return to LAN with the expected kernel endpoint.
+
+The 660-second signaling and STUN outage recorded eleven progress snapshots.
+During the outage, B received 28,992 UDP and 26,149 TCP replies; C received
+29,019 UDP and 26,139 TCP replies. Both retained connection 1 without a daemon
+restart or hub fallback. This covers renewal beyond the ten-minute Noise
+session lifetime with real timers.
+
+#### Source Checks
+
+These checks passed on the same frozen inputs:
+
+- `go test -count=1 ./...`
+- `nix --option eval-cache false develop path:. --command env CGO_ENABLED=1 GOMAXPROCS=2 go test -race -count=1 ./...`
+- `go test -run '^(TestICE|TestDirect|TestNAT|TestFailedLAN|TestLAN|TestRosenpassRoute|TestRosenpassVPN|TestRouteControl)' -count=5 .`
+- `go test -count=20 ./tests/observer`
+- `go vet ./...`
+- Thirty-second fuzz runs with two workers: `FuzzRawUDP` (417,806 executions),
+  `FuzzSecureReceive` (14,943), and `FuzzSecureInnerReceive` (6,128).
+- `gofmt -l .` returned no files; all guest Python files passed AST parsing.
+- `nixfmt --check tests/direct.nix flake.nix` and
+  `nix-instantiate --parse tests/direct.nix` passed. QEMU builds also passed
+  the NixOS test-script type and lint checks.
+- `git diff --check` passed.
+
+The local run records are `/tmp/opencode/wgmesh-rp-final-summary.json` and
+`/tmp/opencode/wgmesh-rp-artifact-proof.json`. Source-check logs use
+`/tmp/opencode/wgmesh-rp-final-*.log`. These temporary paths are local evidence,
+not repository files.
+
+#### Successful Outputs
+
+All 22 successful outputs for this revision are:
+
+```text
+/nix/store/86cc5rzi39jbg1hbib1m85233n7zha8p-vm-test-run-wireguard-mesh-same-lan-routes
+/nix/store/bxyryjpikpv18fgkyw587rvbcmnlkan4-vm-test-run-wireguard-mesh-same-lan-rosenpass-routes
+/nix/store/603g8scwfv6hk34h8mnivi4ysq03lix3-vm-test-run-wireguard-mesh-nat-traversal-rosenpass
+/nix/store/82snsd5vc6h9bp780mqnlk8kh8dxhbnx-vm-test-run-wireguard-mesh-lan-first-nat-fallback
+/nix/store/z4nbhz1fqsxqm2spgbknxlgai4a9z5q5-vm-test-run-wireguard-mesh-lan-first-wg-blocked
+/nix/store/imbpjj8jd1qs5vmzzn1p6rvlnm121k62-vm-test-run-wireguard-mesh-same-lan-stun-down
+/nix/store/z2rfzdx67b3jgkjcvp9xss56s1by5cn5-vm-test-run-wireguard-mesh-same-lan-auto
+/nix/store/dax4kl3y0adzb3k6fsfa6s2978harvgx-vm-test-run-wireguard-mesh-nat-traversal
+/nix/store/7k8xqgfikzkcnh9ds4q37d71fw1q3g0s-vm-test-run-wireguard-mesh-nat-traversal-port-preserving
+/nix/store/k3ka93khv08p0igldq3wk5c332ax70g9-vm-test-run-wireguard-mesh-nat-traversal-blocked
+/nix/store/8xwl3vw1iza72q82xz4g5lxavgcsixs1-vm-test-run-wireguard-mesh-nat-traversal-wg-blocked
+/nix/store/r6g10wl5kbj893kgkfc67w277ydfa4bp-vm-test-run-wireguard-mesh-nat-traversal-symmetric
+/nix/store/wnw3k2ir9q3klrm40v7m7kf7ykij1vip-vm-test-run-wireguard-mesh-nat-traversal-stun-failover
+/nix/store/f9bqwhmk9qx74j9di5x0wl8f8as8dbva-vm-test-run-wireguard-mesh-nat-traversal-one-nat
+/nix/store/iwarf5bjd5g1k7yscrjz58hgal5ai0fi-vm-test-run-wireguard-mesh-nat-traversal-long-outage
+/nix/store/9h2is44lqsqpaxigl9rxk4w708zq295x-vm-test-run-wireguard-mesh-relay-only
+/nix/store/jfqx0q5b140y1z85xa96fbp0gb94z70l-vm-test-run-wireguard-mesh-same-lan
+/nix/store/lnlapya0s5j7w6wjcpx5516lpk6ljcls-vm-test-run-wireguard-mesh-nat
+/nix/store/zzpwqrdivbbcpr4cqwqqjx6yglf5m9fr-vm-test-run-wireguard-mesh-ipv6-transport
+/nix/store/lqsniq2finiyw8zgy7hwffvh8h7pl39b-vm-test-run-wireguard-mesh-rosenpass
+/nix/store/swi8gb32k9w759fba266lp5p6bsw3py5-vm-test-run-wireguard-mesh-rosenpass-adapter
+/nix/store/0gvkq0g946zsrqqs36ccvwwn5wr8q0r4-vm-test-run-wireguard-mesh-rosenpass-rekey
+```
+
+Read `b/mesh-artifacts/measurements.json` in a route/NAT output for both
+directions and event times. Raw samples are in each node's
+`mesh-artifacts/probe.json`. The NAT Rosenpass output also has
+`rp-rekey-watch.json` with the four rotation checks listed above.
+
+#### Limits
+
+Hole punching remains IPv4-only, experimental, and explicitly enabled. These
+runs do not cover arbitrary real NAT devices, ARM execution, route-mode IPv6,
+broader multiple-LAN behavior, maximum mesh size, or public-port flood
+resistance. Endpoint checks are periodic, not a firewall rule. Passing the
+legacy in-place rekey check does not prove a new-PSK handshake. Independent
+security review is still required before production use.
+
+The test run changed no host networking and did not deploy the daemon.
+
+### Previous LAN And NAT Results (a58ffdd)
 
 All eleven automatic-interface and Pion ICE/Coturn profiles passed on
 `x86_64-linux` in separate local KVM runs. All seven original regression checks

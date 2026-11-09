@@ -382,77 +382,97 @@ func (c *routeController) Stage(k wgtypes.Key, ip netip.Addr, psk wgtypes.Key, e
 func (c *routeController) Apply(k wgtypes.Key, ip netip.Addr, psk wgtypes.Key, endpoint netip.AddrPort) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	_, err := c.apply(k, ip, psk, endpoint, false)
+	return err
+}
+
+func (c *routeController) EnsureEndpoint(k wgtypes.Key, ip netip.Addr, psk wgtypes.Key, endpoint netip.AddrPort) (bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.apply(k, ip, psk, endpoint, true)
+}
+
+func (c *routeController) apply(k wgtypes.Key, ip netip.Addr, psk wgtypes.Key, endpoint netip.AddrPort, activeOnly bool) (bool, error) {
 	if !routeValidEndpoint(endpoint) {
-		return errors.New("invalid direct endpoint")
+		return false, errors.New("invalid direct endpoint")
 	}
 	r := c.journal.Peers[k.String()]
-	if r == nil || (r.Phase != "staged" && r.Phase != "active") || r.IP != ip || r.PSKHash != sha256.Sum256(psk[:]) {
-		return errors.New("stage peer before apply")
+	if r == nil || (r.Phase != "staged" && r.Phase != "active") || (activeOnly && r.Phase != "active") || r.IP != ip || r.PSKHash != sha256.Sum256(psk[:]) {
+		return false, errors.New("stage peer before apply")
 	}
 	d, e := c.devices()
 	if e != nil {
-		return e
+		return false, e
 	}
 	if e = c.peer(d, k, r); e != nil {
-		return e
+		return false, e
 	}
 	if controlFindPeer(d, k).LastHandshakeTime.IsZero() {
-		return errors.New("direct handshake required")
+		return false, errors.New("direct handshake required")
 	}
 	found, e := c.inspectRoute(r)
 	if e != nil {
-		return e
+		return false, e
 	}
-	if r.Phase == "active" {
-		if !found {
-			return errors.New("managed route disappeared")
-		}
-		if controlFindPeer(d, k).Endpoint != nil && controlFindPeer(d, k).Endpoint.AddrPort() == endpoint {
-			return nil
-		}
+	if found != (r.Phase == "active") {
+		return false, errors.New("unexpected host route")
+	}
+	changed := controlFindPeer(d, k).Endpoint == nil || controlFindPeer(d, k).Endpoint.AddrPort() != endpoint
+	if changed {
 		if e = c.client.ConfigureDevice(c.journal.Direct, wgtypes.Config{Peers: []wgtypes.PeerConfig{{PublicKey: k, UpdateOnly: true, Endpoint: net.UDPAddrFromAddrPort(endpoint)}}}); e != nil {
-			return e
+			return false, e
 		}
 		d, e = c.devices()
 		if e != nil {
-			return e
+			return false, e
 		}
 		if e = c.peer(d, k, r); e != nil {
-			return e
+			return false, e
 		}
 		p := controlFindPeer(d, k)
-		if p.Endpoint == nil || p.Endpoint.AddrPort() != endpoint {
-			return errors.New("endpoint update not applied")
+		if p.LastHandshakeTime.IsZero() {
+			return false, errors.New("direct handshake disappeared")
 		}
-		return nil
+		found, e = c.inspectRoute(r)
+		if e != nil {
+			return false, e
+		}
+		if found != (r.Phase == "active") {
+			return false, errors.New("unexpected host route")
+		}
+		if p.Endpoint == nil || p.Endpoint.AddrPort() != endpoint {
+			// Valid transport packets can race this update. Do not add a
+			// staged route or report endpoint maintenance as successful.
+			return true, errEndpointRoamed
+		}
 	}
-	if found {
-		return errors.New("route already exists")
+	if r.Phase == "active" {
+		return changed, nil
 	}
 	r.Phase = "routing"
 	if e = c.save(); e != nil {
 		r.Phase = "staged"
-		return e
+		return false, e
 	}
 	found, e = c.inspectRoute(r)
 	if e != nil {
-		return e
+		return false, e
 	}
 	if found {
-		return errors.New("route appeared before add")
+		return false, errors.New("route appeared before add")
 	}
 	if e = c.routes.add(c.route(ip)); e != nil {
-		return e
+		return false, e
 	}
 	found, e = c.inspectRoute(r)
 	if e != nil {
-		return e
+		return false, e
 	}
 	if !found {
-		return errors.New("route add not applied")
+		return false, errors.New("route add not applied")
 	}
 	r.Phase = "active"
-	return c.save()
+	return changed, c.save()
 }
 func (c *routeController) Restore(k wgtypes.Key) error {
 	c.mu.Lock()

@@ -61,6 +61,7 @@ type natConfig struct {
 	Experimental bool             `json:"experimental"`
 	Servers      []netip.AddrPort `json:"stun_servers"`
 	Refresh      duration         `json:"refresh_interval"`
+	LANFirst     duration         `json:"lan_first_timeout"`
 }
 
 func defaults() config {
@@ -147,12 +148,21 @@ func readConfig(r io.Reader) (config, error) {
 		c.BroadcastAfter < c.Probe || c.Cooldown < c.Probe || c.MinGain < 0 || c.Gain < 0 || c.Gain >= 1 {
 		return c, errors.New("invalid timing or improvement policy; see README")
 	}
+	if c.NAT != nil {
+		minimum := c.Window + 2*c.Probe
+		if c.NAT.LANFirst == 0 {
+			c.NAT.LANFirst = max(duration(30*time.Second), minimum)
+		}
+		if c.NAT.LANFirst < minimum || c.NAT.LANFirst > duration(10*time.Minute) {
+			return c, errors.New("lan_first_timeout must allow latency_window plus two probes and must not exceed 10m")
+		}
+	}
 	keys, ips := map[wgtypes.Key]bool{}, map[netip.Addr]bool{c.Address: true}
 	adapter := false
 	for i := range c.Peers {
 		p := &c.Peers[i]
-		if c.DirectInterface != "" && (p.RosenpassSocket != "" || p.ExperimentalRekey) {
-			return c, errors.New("route-based peering does not support the Rosenpass adapter or experimental in-place rekey")
+		if c.DirectInterface != "" && p.ExperimentalRekey {
+			return c, errors.New("route-based peering requires a new peer and handshake on key rotation; experimental in-place rekey is unsupported")
 		}
 		var err error
 		p.key, err = wgtypes.ParseKey(p.PublicKey)

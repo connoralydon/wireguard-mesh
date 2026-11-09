@@ -24,22 +24,25 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
 type rosenpassConfig struct {
-	Executable        string  `json:"executable"`
-	Peer              string  `json:"peer"`
-	PublicKeyFile     string  `json:"public_key_file"`
-	SecretKeyFile     string  `json:"secret_key_file"`
-	PeerPublicKeyFile string  `json:"peer_public_key_file"`
-	ListenPort        uint16  `json:"listen_port"`
-	RemotePort        uint16  `json:"remote_port"`
-	PSKFile           string  `json:"psk_file"`
-	RuntimeDir        string  `json:"runtime_dir"`
-	Socket            string  `json:"socket"`
-	DaemonUID         *uint32 `json:"daemon_uid"` // Required; UID 0 is permitted for the mesh daemon.
+	Executable        string     `json:"executable"`
+	Peer              string     `json:"peer"`
+	PublicKeyFile     string     `json:"public_key_file"`
+	SecretKeyFile     string     `json:"secret_key_file"`
+	PeerPublicKeyFile string     `json:"peer_public_key_file"`
+	ListenPort        uint16     `json:"listen_port"`
+	RemotePort        uint16     `json:"remote_port"`
+	PSKFile           string     `json:"psk_file"`
+	RuntimeDir        string     `json:"runtime_dir"`
+	Socket            string     `json:"socket"`
+	DaemonUID         *uint32    `json:"daemon_uid"` // Required; UID 0 is permitted for the mesh daemon.
+	TunnelInterface   string     `json:"tunnel_interface,omitempty"`
+	TunnelPeerIP      netip.Addr `json:"tunnel_peer_ip,omitempty"`
 }
 
 func readRosenpassConfig(r io.Reader) (rosenpassConfig, error) {
@@ -57,6 +60,10 @@ func readRosenpassConfig(r io.Reader) (rosenpassConfig, error) {
 	if err != nil || key == (wgtypes.Key{}) || key.String() != c.Peer ||
 		c.ListenPort < 1024 || c.RemotePort < 1024 || c.DaemonUID == nil {
 		return c, errors.New("set a fixed WireGuard peer, unprivileged ports, and daemon_uid")
+	}
+	if (c.TunnelInterface == "") != !c.TunnelPeerIP.IsValid() ||
+		(c.TunnelInterface != "" && (!validName(c.TunnelInterface) || !rosenpassVPNAddress(c.TunnelPeerIP))) {
+		return c, errors.New("set a valid tunnel_interface and tunnel_peer_ip together")
 	}
 	paths := []string{c.Executable, c.PublicKeyFile, c.SecretKeyFile, c.PeerPublicKeyFile, c.PSKFile, c.RuntimeDir, c.Socket}
 	for i, path := range paths {
@@ -126,6 +133,11 @@ func serveRosenpassAdapter(ctx context.Context, c rosenpassConfig) (result error
 		return err
 	}
 	a := &rosenpassAdapter{config: c, status: rosenpassResponse{Instance: hex.EncodeToString(id)}, validate: validateRosenpassRequest}
+	if c.TunnelInterface != "" {
+		a.validate = func(r rosenpassRequest) (rosenpassRequest, error) {
+			return validateRosenpassVPNRequest(r, c)
+		}
+	}
 	a.start = a.startProcess
 	if err := a.invalidate(); err != nil {
 		return err
@@ -260,6 +272,37 @@ func validateRosenpassRequest(r rosenpassRequest) (rosenpassRequest, error) {
 	return rosenpassOnLink(r, *iface, prefixes)
 }
 
+func rosenpassVPNAddress(a netip.Addr) bool {
+	return a.IsValid() && a.Zone() == "" && !a.Is4In6() && a.IsGlobalUnicast() && !a.IsLinkLocalUnicast() && !a.IsLoopback()
+}
+
+func validateRosenpassVPNRequest(r rosenpassRequest, c rosenpassConfig) (rosenpassRequest, error) {
+	iface, err := net.InterfaceByIndex(r.Link.Index)
+	if err != nil {
+		return r, errors.New("Rosenpass tunnel interface is unavailable")
+	}
+	link, err := netlink.LinkByIndex(r.Link.Index)
+	if err != nil || link.Attrs() == nil || link.Attrs().Index != iface.Index || link.Attrs().Name != iface.Name {
+		return r, errors.New("Rosenpass tunnel link is unavailable")
+	}
+	prefixes, err := interfacePrefixes(*iface)
+	if err != nil {
+		return r, errors.New("Rosenpass tunnel addresses are unavailable")
+	}
+	return rosenpassVPNOnLink(r, c, *iface, link.Type(), prefixes)
+}
+
+func rosenpassVPNOnLink(r rosenpassRequest, c rosenpassConfig, iface net.Interface, kind string, prefixes []netip.Prefix) (rosenpassRequest, error) {
+	p, local := r.Link.Prefix, r.Link.Prefix.Addr()
+	if iface.Index <= 0 || r.Link.Index != iface.Index || r.Link.Name != iface.Name || iface.Name != c.TunnelInterface ||
+		iface.Flags&net.FlagUp == 0 || kind != "wireguard" || !p.IsValid() || !slices.Contains(prefixes, p) ||
+		!rosenpassVPNAddress(local) || !rosenpassVPNAddress(r.Address) || r.Address != c.TunnelPeerIP ||
+		local.Is4() != r.Address.Is4() || local == r.Address {
+		return r, errors.New("Rosenpass endpoint must use the configured WireGuard tunnel and peer")
+	}
+	return r, nil
+}
+
 func rosenpassOnLink(r rosenpassRequest, iface net.Interface, prefixes []netip.Prefix) (rosenpassRequest, error) {
 	p, remote := r.Link.Prefix, r.Address.WithZone("")
 	zone := strconv.Itoa(iface.Index)
@@ -361,6 +404,14 @@ func (a *rosenpassAdapter) refresh(now time.Time) error {
 // https://github.com/rosenpass/rosenpass/tree/v0.2.3/rosenpass/src
 // One peer only; no WireGuard output, commands, or hub configuration is passed.
 func (a *rosenpassAdapter) startProcess(r rosenpassRequest, generation uint64) (*rosenpassChild, error) {
+	initiate := true
+	if a.config.TunnelInterface != "" {
+		var err error
+		initiate, err = rosenpassInitialInitiator(a.config.PublicKeyFile, a.config.PeerPublicKeyFile)
+		if err != nil {
+			return nil, err
+		}
+	}
 	dir, err := os.MkdirTemp(a.config.RuntimeDir, "child-")
 	if err != nil {
 		return nil, err
@@ -375,10 +426,14 @@ func (a *rosenpassAdapter) startProcess(r rosenpassRequest, generation uint64) (
 	if local.Is6() && local.IsLinkLocalUnicast() {
 		local = local.WithZone(strconv.Itoa(r.Link.Index))
 	}
-	cmd := exec.Command(a.config.Executable, "exchange", "public-key", a.config.PublicKeyFile,
+	args := []string{"exchange", "public-key", a.config.PublicKeyFile,
 		"secret-key", a.config.SecretKeyFile, "listen", netip.AddrPortFrom(local, a.config.ListenPort).String(),
-		"peer", "public-key", a.config.PeerPublicKeyFile, "endpoint", netip.AddrPortFrom(r.Address, a.config.RemotePort).String(),
-		"outfile", "psk.raw")
+		"peer", "public-key", a.config.PeerPublicKeyFile}
+	if initiate {
+		args = append(args, "endpoint", netip.AddrPortFrom(r.Address, a.config.RemotePort).String())
+	}
+	args = append(args, "outfile", "psk.raw")
+	cmd := exec.Command(a.config.Executable, args...)
 	cmd.Dir = dir
 	cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
 	// Wait must not close the reader while the scanner is using it.
@@ -429,6 +484,42 @@ func (a *rosenpassAdapter) startProcess(r rosenpassRequest, generation uint64) (
 		a.mu.Unlock()
 	}()
 	return c, nil
+}
+
+// Two initial handshakes can finish in different orders and publish different
+// keys. In VPN mode only the lower raw Rosenpass public key starts one. The
+// other side listens, learns its authenticated endpoint, and can rekey later.
+// This changes startup only; possession checks are still required on every key.
+func rosenpassInitialInitiator(local, remote string) (bool, error) {
+	read := func(path string) ([]byte, error) {
+		f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+		if err != nil {
+			return nil, errors.New("Rosenpass public identity is unavailable")
+		}
+		defer f.Close()
+		info, err := f.Stat()
+		if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > 1<<20 {
+			return nil, errors.New("invalid Rosenpass public identity file")
+		}
+		b, err := io.ReadAll(io.LimitReader(f, 1<<20+1))
+		if err != nil || len(b) == 0 || len(b) > 1<<20 {
+			return nil, errors.New("invalid Rosenpass public identity file")
+		}
+		return b, nil
+	}
+	a, err := read(local)
+	if err != nil {
+		return false, err
+	}
+	b, err := read(remote)
+	if err != nil {
+		return false, err
+	}
+	order := bytes.Compare(a, b)
+	if order == 0 {
+		return false, errors.New("Rosenpass peers need distinct public identities")
+	}
+	return order < 0, nil
 }
 
 func parseRosenpassEvent(line string) string {

@@ -67,6 +67,57 @@ func TestConfigAutomaticInterface(t *testing.T) {
 	}
 }
 
+func TestConfigRosenpassRouteMode(t *testing.T) {
+	peer := fmt.Sprintf(`{"public_key":%q,"ip":"10.0.0.3","preshared_key_file":"/run/rosenpass/peer.psk","rosenpass_socket":"/run/rosenpass/adapter.sock"}`, controlTestKey(7).PublicKey().String())
+	for _, version := range []string{"", `"version":1,`, `"version":2,`} {
+		c, err := readConfig(strings.NewReader(`{` + version + `"address":"10.0.0.2","peers":[` + peer + `]}`))
+		if err != nil || c.Peers[0].RosenpassSocket == "" || c.Peers[0].ExperimentalRekey {
+			t.Fatal("Rosenpass configuration rejected:", err)
+		}
+		if (c.DirectInterface == "auto") != strings.Contains(version, "2") {
+			t.Fatal("Rosenpass changed the configuration's route mode")
+		}
+	}
+	peer = strings.TrimSuffix(peer, "}") + `,"experimental_in_place_rekey":true}`
+	if _, err := readConfig(strings.NewReader(`{"version":2,"address":"10.0.0.2","peers":[` + peer + `]}`)); err == nil {
+		t.Fatal("route mode accepted experimental PSK-only rekey")
+	}
+	if c, err := readConfig(strings.NewReader(`{"address":"10.0.0.2","peers":[` + peer + `]}`)); err != nil || c.DirectInterface != "" {
+		t.Fatal("legacy Rosenpass and rekey configuration changed:", err)
+	}
+}
+
+func TestConfigLANFirstTimeout(t *testing.T) {
+	base := fmt.Sprintf(`"version":2,"address":"10.0.0.2","peers":[{"public_key":%q,"ip":"10.0.0.3"}]`, controlTestKey(7).PublicKey().String())
+	for _, tc := range []struct {
+		fields string
+		wait   time.Duration
+	}{
+		{"", 30 * time.Second},
+		{`"latency_window":"60s"`, 62 * time.Second},
+		{`"probe_interval":"200ms","latency_window":"5s","failure_timeout":"2s"`, 8 * time.Second},
+	} {
+		nat := `"experimental":true,"stun_servers":["203.0.113.1:3478"]`
+		if tc.wait == 8*time.Second {
+			nat += `,"lan_first_timeout":"8s"`
+		}
+		fields := base + `,"nat_traversal":{` + nat + `}`
+		if tc.fields != "" {
+			fields += "," + tc.fields
+		}
+		c, err := readConfig(strings.NewReader("{" + fields + "}"))
+		if err != nil || time.Duration(c.NAT.LANFirst) != tc.wait {
+			t.Fatal("wrong LAN-first opportunity:", err)
+		}
+	}
+	for _, wait := range []string{"1s", "15s", "11m", "-1s"} {
+		text := "{" + base + `,"nat_traversal":{"experimental":true,"stun_servers":["203.0.113.1:3478"],"lan_first_timeout":` + fmt.Sprintf("%q", wait) + "}}"
+		if _, err := readConfig(strings.NewReader(text)); err == nil {
+			t.Fatal("insufficient or unbounded LAN-first timeout accepted")
+		}
+	}
+}
+
 func TestConfigRejectsInvalid(t *testing.T) {
 	peer := fmt.Sprintf(`{"public_key":%q,"ip":"10.0.0.3"}`, controlTestKey(7).PublicKey().String())
 	base := `"address":"10.0.0.2","peers":[` + peer + `]`

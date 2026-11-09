@@ -17,6 +17,8 @@ type routeFakeWG struct {
 	writes         int
 	partialAdd     bool
 	failRemove     bool
+	failUpdate     bool
+	ignoreUpdate   bool
 }
 
 func (f *routeFakeWG) Device(n string) (*wgtypes.Device, error) {
@@ -45,11 +47,16 @@ func (f *routeFakeWG) ConfigureDevice(n string, c wgtypes.Config) error {
 			continue
 		}
 		if p.UpdateOnly {
+			if f.failUpdate {
+				return errors.New("update failed")
+			}
 			peer := controlFindPeer(&f.direct, p.PublicKey)
 			if peer == nil || p.PresharedKey != nil || p.PersistentKeepaliveInterval != nil || len(p.AllowedIPs) != 0 {
 				return errors.New("invalid endpoint update")
 			}
-			peer.Endpoint = p.Endpoint
+			if !f.ignoreUpdate {
+				peer.Endpoint = p.Endpoint
+			}
 			continue
 		}
 		if f.partialAdd {
@@ -66,6 +73,7 @@ type routeFakeOps struct {
 	entries            []netlink.Route
 	adds, deletes      int
 	addError, delError bool
+	onAdd              func()
 }
 
 func (*routeFakeOps) index(string) (int, error) { return 12, nil }
@@ -79,6 +87,9 @@ func (f *routeFakeOps) list(ip netip.Addr) ([]netlink.Route, error) {
 	return out, nil
 }
 func (f *routeFakeOps) add(r netlink.Route) error {
+	if f.onAdd != nil {
+		f.onAdd()
+	}
 	f.adds++
 	f.entries = append(f.entries, r)
 	if f.addError {
@@ -86,6 +97,103 @@ func (f *routeFakeOps) add(r netlink.Route) error {
 		return errors.New("add applied with error")
 	}
 	return nil
+}
+
+func TestRouteControlStagedRoamBeforeApply(t *testing.T) {
+	c, w, routes, _ := routeFixture(t)
+	k, psk := controlTestKey(3), controlTestKey(5)
+	ip := netip.MustParseAddr("10.0.0.2")
+	lan := netip.MustParseAddrPort("192.0.2.2:51820")
+	if _, err := c.Stage(k, ip, psk, lan); err != nil {
+		t.Fatal(err)
+	}
+	w.direct.Peers[0].LastHandshakeTime = time.Now()
+	w.direct.Peers[0].Endpoint = net.UDPAddrFromAddrPort(netip.MustParseAddrPort("198.51.100.2:40002"))
+	w.ignoreUpdate = true
+	if err := c.Apply(k, ip, psk, lan); !errors.Is(err, errEndpointRoamed) || routes.adds != 0 || c.journal.Peers[k.String()].Phase != "staged" {
+		t.Fatal("racing endpoint update promoted a staged route:", err)
+	}
+	w.ignoreUpdate = false
+	routes.onAdd = func() {
+		if got := w.direct.Peers[0].Endpoint.AddrPort(); got != lan {
+			t.Errorf("endpoint at route add = %v, want %v", got, lan)
+		}
+	}
+	if err := c.Apply(k, ip, psk, lan); err != nil {
+		t.Fatal(err)
+	}
+	if routes.adds != 1 {
+		t.Fatal("route not added")
+	}
+}
+
+func TestRouteControlEnsureEndpoint(t *testing.T) {
+	c, w, routes, _ := routeFixture(t)
+	k, psk := controlTestKey(3), controlTestKey(5)
+	ip := netip.MustParseAddr("10.0.0.2")
+	lan := netip.MustParseAddrPort("192.0.2.2:51820")
+	if _, err := c.Stage(k, ip, psk, lan); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.EnsureEndpoint(k, ip, psk, lan); err == nil {
+		t.Fatal("accepted staged peer")
+	}
+	handshake := time.Now().Add(-time.Hour)
+	w.direct.Peers[0].LastHandshakeTime = handshake
+	if err := c.Apply(k, ip, psk, lan); err != nil {
+		t.Fatal(err)
+	}
+	writes := w.writes
+	if changed, err := c.EnsureEndpoint(k, ip, psk, lan); err != nil || changed || w.writes != writes {
+		t.Fatalf("unchanged endpoint: changed=%v err=%v writes=%d", changed, err, w.writes)
+	}
+	peer := &w.direct.Peers[0]
+	peer.Endpoint = net.UDPAddrFromAddrPort(netip.MustParseAddrPort("198.51.100.2:40002"))
+	peer.ReceiveBytes, peer.TransmitBytes = 123, 456
+	if changed, err := c.EnsureEndpoint(k, ip, psk, lan); err != nil || !changed {
+		t.Fatalf("roamed endpoint: changed=%v err=%v", changed, err)
+	}
+	if peer.Endpoint.AddrPort() != lan || peer.PresharedKey != psk || peer.ReceiveBytes != 123 || peer.TransmitBytes != 456 || !peer.LastHandshakeTime.Equal(handshake) || len(routes.entries) != 1 || routes.adds != 1 || routes.deletes != 0 {
+		t.Fatal("endpoint update changed peer or route state")
+	}
+	for _, scenario := range []string{"psk", "ip", "handshake", "route", "owner", "write", "drift"} {
+		t.Run(scenario, func(t *testing.T) {
+			c, w, routes, _ := routeFixture(t)
+			if _, err := c.Stage(k, ip, psk, lan); err != nil {
+				t.Fatal(err)
+			}
+			w.direct.Peers[0].LastHandshakeTime = handshake
+			if err := c.Apply(k, ip, psk, lan); err != nil {
+				t.Fatal(err)
+			}
+			w.direct.Peers[0].Endpoint = net.UDPAddrFromAddrPort(netip.MustParseAddrPort("198.51.100.2:40002"))
+			wantIP, wantPSK := ip, psk
+			switch scenario {
+			case "psk":
+				wantPSK = controlTestKey(6)
+			case "ip":
+				wantIP = netip.MustParseAddr("10.0.0.3")
+			case "handshake":
+				w.direct.Peers[0].LastHandshakeTime = time.Time{}
+			case "route":
+				routes.entries = append(routes.entries, routes.entries[0])
+			case "owner":
+				w.stable.Peers[0].AllowedIPs = nil
+			case "write":
+				w.failUpdate = true
+			case "drift":
+				w.ignoreUpdate = true
+			}
+			changed, err := c.EnsureEndpoint(k, wantIP, wantPSK, lan)
+			if scenario == "drift" {
+				if !changed || !errors.Is(err, errEndpointRoamed) {
+					t.Fatalf("endpoint drift was not reported for bounded retry: changed=%v err=%v", changed, err)
+				}
+			} else if err == nil || changed {
+				t.Fatalf("accepted %s: changed=%v err=%v", scenario, changed, err)
+			}
+		})
+	}
 }
 func (f *routeFakeOps) del(r netlink.Route) error {
 	f.deletes++

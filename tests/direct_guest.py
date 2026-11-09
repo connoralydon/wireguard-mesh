@@ -2,9 +2,12 @@
 import base64
 import hashlib
 import json
+import os
 import pathlib
+import pwd
 import re
 import signal
+import shutil
 import socket
 import subprocess
 import sys
@@ -214,11 +217,15 @@ if command == "setup":
             run("wg", "set", "wg0", "peer", keys(peer)[1], "allowed-ips", f"10.77.0.{n}/32")
         run("tc", "qdisc", "add", "dev", "wg0", "root", "netem", "delay", "40ms")
     else:
-        if mode.startswith("nat-traversal") and not (mode == "nat-traversal-one-nat" and name == "c"):
+        if (mode.startswith("nat-traversal") or mode.startswith("lan-first-")) and not (mode == "nat-traversal-one-nat" and name == "c"):
             run("ip", "route", "replace", "192.0.2.0/24", "via", f"172.20.{number}.1", "dev", "lan")
         run("wg", "set", "wg0", "peer", keys("a")[1], "allowed-ips", "10.77.0.0/24", "endpoint", "192.0.2.1:51820", "persistent-keepalive", "1")
         peer, remote = ("c", 3) if name == "b" else ("b", 2)
         config = {"version": 2, "address": f"10.77.0.{number}", "peers": [{"public_key": keys(peer)[1], "ip": f"10.77.0.{remote}"}], "exclude": ["eth0", "wan"], "discovery_interval": "1s", "broadcast_after": "3s", "probe_interval": "200ms", "latency_window": "5s", "failure_timeout": "2s", "cooldown": "3s", "minimum_gain": "2ms", "minimum_gain_fraction": 0.2, "direct_listen_port": 51821, "route_metric": 50}
+        if "rosenpass" in mode:
+            config["peers"][0].update({"preshared_key_file": "/run/wireguard-mesh-rosenpass-wg0/peer.psk", "rosenpass_socket": "/run/wireguard-mesh-rosenpass-wg0/adapter.sock"})
+            if mode == "same-lan-rosenpass-routes":
+                config.pop("direct_listen_port")
         if mode == "same-lan-auto":
             config.pop("direct_listen_port")
             foreign = "wgm-" + hashlib.sha256(("wg0\0" + keys(name)[1]).encode()).hexdigest()[:8]
@@ -226,8 +233,8 @@ if command == "setup":
             run("ip", "link", "set", foreign, "alias", "foreign-test-interface", "up")
             pathlib.Path("/tmp/mesh-foreign-name").write_text(foreign)
             pathlib.Path("/tmp/mesh-foreign-snapshot").write_text(run("ip", "-j", "-d", "link", "show", "dev", foreign))
-        if mode.startswith("nat-traversal"):
-            config["nat_traversal"] = {"experimental": True, "stun_servers": ["192.0.2.1:3478"], "refresh_interval": "1s"}
+        if mode.startswith("nat-traversal") or mode.startswith("lan-first-"):
+            config["nat_traversal"] = {"experimental": True, "stun_servers": ["192.0.2.1:3478"], "refresh_interval": "1s", "lan_first_timeout": "8s"}
             if mode == "nat-traversal-one-nat" and name == "c":
                 config["exclude"] = ["eth0"]
             if mode == "nat-traversal-stun-failover":
@@ -239,6 +246,67 @@ if command == "setup":
         (directory / "wg0.json").write_text(json.dumps(config))
 elif command == "public":
     print(keys(sys.argv[2])[1])
+elif command == "rp-setup":
+    name = sys.argv[2]
+    local, remote = (2, 3) if name == "b" else (3, 2)
+    producer, group = "mesh-rosenpass-wg0", "mesh-psk-wg0"
+    directory = pathlib.Path("/var/lib/mesh-rosenpass-wg0")
+    directory.mkdir(mode=0o700, exist_ok=True)
+    shutil.chown(directory, producer, group)
+    run("runuser", "-u", producer, "--", "rosenpass", "gen-keys", "--public-key", str(directory / "public"), "--secret-key", str(directory / "secret"))
+    runtime = "/run/wireguard-mesh-rosenpass-wg0"
+    config = {"executable": shutil.which("rosenpass"), "peer": keys("c" if name == "b" else "b")[1],
+              "public_key_file": str(directory / "public"), "secret_key_file": str(directory / "secret"),
+              "peer_public_key_file": str(directory / "peer-public"), "listen_port": 51822, "remote_port": 51822,
+              "psk_file": runtime + "/peer.psk", "runtime_dir": runtime + "/private", "socket": runtime + "/adapter.sock",
+              "daemon_uid": pwd.getpwnam("mesh-wg0").pw_uid, "tunnel_interface": "wg0", "tunnel_peer_ip": f"10.77.0.{remote}"}
+    path = pathlib.Path("/etc/wireguard-mesh/rosenpass-wg0.json")
+    path.write_text(json.dumps(config))
+    path.chmod(0o644)
+    for interface in ("lan", "wan"):
+        run("iptables", "-A", "OUTPUT", "-o", interface, "-p", "udp", "--dport", "51822", "-j", "DROP")
+    run("iptables", "-N", "MESH_RP_VPN")
+    run("iptables", "-A", "INPUT", "-i", "wg0", "-p", "udp", "--dport", "51822", "-j", "MESH_RP_VPN")
+    run("iptables", "-A", "MESH_RP_VPN", "-j", "RETURN")
+elif command == "rp-check":
+    peer = keys(sys.argv[2])[1]
+    path = pathlib.Path("/run/wireguard-mesh-rosenpass-wg0/peer.psk")
+    output = path.read_text().strip()
+    raw = base64.b64decode(output, validate=True)
+    assert len(raw) == 32 and any(raw) and base64.b64encode(raw).decode() == output, "Invalid adapter PSK"
+    info = path.stat()
+    assert info.st_uid == pwd.getpwnam("mesh-rosenpass-wg0").pw_uid and info.st_mode & 0o7777 == 0o640, "Unsafe PSK permissions"
+    assert 0 <= time.time() - info.st_mtime < 180, "Adapter PSK is not fresh"
+    installed = dict(line.split("\t", 1) for line in run("wg", "show", owned_interface(), "preshared-keys").splitlines())
+    assert installed.get(peer) == output and output != "(none)", "Direct PSK does not match adapter output"
+elif command == "rp-mark":
+    path = pathlib.Path("/run/mesh-rp-test-key")
+    path.write_text(pathlib.Path("/run/wireguard-mesh-rosenpass-wg0/peer.psk").read_text())
+    path.chmod(0o600)
+elif command == "rp-initial-role":
+    directory = pathlib.Path("/var/lib/mesh-rosenpass-wg0")
+    initiate = (directory / "public").read_bytes() < (directory / "peer-public").read_bytes()
+    matches = []
+    for comm in pathlib.Path("/proc").glob("[0-9]*/comm"):
+        try:
+            if comm.read_text().strip() == "rosenpass":
+                args = (comm.parent / "cmdline").read_bytes().split(b"\0")
+                matches.append(b"endpoint" in args)
+        except FileNotFoundError:
+            continue
+    assert len(matches) == 1 and matches[0] == initiate, "Incorrect Rosenpass initial role"
+    print(json.dumps({"initiator": initiate}))
+elif command == "rp-changed":
+    old = pathlib.Path("/run/mesh-rp-test-key").read_text().strip()
+    new = pathlib.Path("/run/wireguard-mesh-rosenpass-wg0/peer.psk").read_text().strip()
+    assert new and new != old, "Adapter did not publish a new PSK"
+elif command == "rp-orphan":
+    path = pathlib.Path("/run/wireguard-mesh-rosenpass-wg0/peer.psk")
+    path.parent.mkdir(mode=0o750, exist_ok=True)
+    shutil.chown(path.parent, "mesh-rosenpass-wg0", "mesh-psk-wg0")
+    path.write_text(pathlib.Path("/run/mesh-rp-test-key").read_text())
+    shutil.chown(path, "mesh-rosenpass-wg0", "mesh-psk-wg0")
+    path.chmod(0o640)
 elif command == "state":
     print(json.dumps(state(sys.argv[2])))
 elif command == "owned":
@@ -277,6 +345,15 @@ elif command == "wg-blocked-counter":
               if (match := re.match(r"\[(\d+):\d+\]", line))]
     assert len(counts) == 4
     print(json.dumps(counts))
+elif command == "pairlan-wg-block":
+    action = "-A" if sys.argv[2] == "on" else "-D"
+    for packet_type in range(1, 5):
+        expression = f"0>>22&0x3C@8=0x{packet_type:02x}000000"
+        run("iptables", action, "OUTPUT", "-o", "pairlan", "-p", "udp", "--sport", "51821", "-m", "u32", "--u32", expression, "-j", "DROP")
+elif command == "no-lan-trial":
+    invocation = run("systemctl", "show", "wireguard-meshd@wg0.service", "-p", "InvocationID", "--value")
+    lines = run("journalctl", "-b", "_SYSTEMD_INVOCATION_ID=" + invocation, "--no-pager", "-o", "cat").splitlines()
+    assert not any("direct path trial" in line and f"endpoint=172.21.4.{sys.argv[2]}:51823" in line for line in lines), "LAN trial began despite blocked WireGuard"
 elif command == "ice-selected":
     invocation = run("systemctl", "show", "wireguard-meshd@wg0.service", "-p", "InvocationID", "--value")
     lines = run("journalctl", "-b", "_SYSTEMD_INVOCATION_ID=" + invocation, "--no-pager", "-o", "cat").splitlines()
@@ -313,25 +390,9 @@ elif command == "probe-progress-after":
     progress = json.loads(pathlib.Path("/tmp/mesh-artifacts/probe-progress.json").read_text())
     assert progress["tcp"]["connection"] == 1 and progress["tcp"]["received"] is not None
     assert progress["tcp"]["received"] > float(sys.argv[2])
-elif command == "watch-route":
-    remote, peer = sys.argv[2:]
-    deadline = time.monotonic() + 120
-    previous = 0
-    result = {"route_seen": False, "handshake_before_route": False}
-    while time.monotonic() < deadline:
-        route = run("ip", "route", "get", remote)
-        try:
-            interface = owned_interface()
-        except ValueError:
-            time.sleep(.02)
-            continue
-        if f"dev {interface}" in route:
-            result.update({"route_seen": True, "handshake_before_route": previous > 0, "time": time.time()})
-            break
-        previous = int(state(interface)["latest-handshakes"].get(peer, "0"))
-        time.sleep(.02)
-    pathlib.Path("/tmp/mesh-artifacts").mkdir(exist_ok=True)
-    pathlib.Path("/tmp/mesh-artifacts/route-watch.json").write_text(json.dumps(result))
+elif command == "probe-udp-after":
+    progress = json.loads(pathlib.Path("/tmp/mesh-artifacts/probe-progress.json").read_text())
+    assert progress["udp"]["seq"] > int(sys.argv[2])
 elif command == "watch-no-route":
     remote, peer = sys.argv[2:]
     done = threading.Event()

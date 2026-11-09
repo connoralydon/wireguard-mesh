@@ -17,14 +17,17 @@ import (
 // ICE discovers and checks transport candidates. Only the mesh event loop can
 // authorize a WireGuard trial or change a route. LAN discovery is independent.
 type natState struct {
-	transport wireGuardUDP
-	engine    *iceTraversal
-	links     []linkAddr
-	starts    map[[16]byte]natStart
-	selected  map[wgtypes.Key]netip.AddrPort
-	remote    map[wgtypes.Key]string
-	restartAt map[wgtypes.Key]time.Time
-	retryAt   time.Time
+	transport      wireGuardUDP
+	engine         *iceTraversal
+	links          []linkAddr
+	starts         map[[16]byte]natStart
+	selected       map[wgtypes.Key]netip.AddrPort
+	remote         map[wgtypes.Key]string
+	restartAt      map[wgtypes.Key]time.Time
+	lanUntil       map[wgtypes.Key]time.Time
+	failedLAN      map[wgtypes.Key]map[netip.Addr]time.Time
+	failedLANUntil map[wgtypes.Key]time.Time
+	retryAt        time.Time
 }
 
 type natStart struct {
@@ -34,7 +37,40 @@ type natStart struct {
 }
 
 func (m *mesh) enableNAT(t wireGuardUDP) {
-	m.nat = &natState{transport: t, starts: make(map[[16]byte]natStart), selected: make(map[wgtypes.Key]netip.AddrPort), remote: make(map[wgtypes.Key]string), restartAt: make(map[wgtypes.Key]time.Time)}
+	m.nat = &natState{transport: t, starts: make(map[[16]byte]natStart), selected: make(map[wgtypes.Key]netip.AddrPort), remote: make(map[wgtypes.Key]string), restartAt: make(map[wgtypes.Key]time.Time), lanUntil: make(map[wgtypes.Key]time.Time), failedLAN: make(map[wgtypes.Key]map[netip.Addr]time.Time), failedLANUntil: make(map[wgtypes.Key]time.Time)}
+}
+
+func (m *mesh) excludedLAN(key wgtypes.Key, now time.Time) []netip.Addr {
+	var result []netip.Addr
+	for ip, until := range m.nat.failedLAN[key] {
+		if !now.Before(until) {
+			delete(m.nat.failedLAN[key], ip)
+		} else {
+			result = append(result, ip)
+		}
+	}
+	return result
+}
+
+func (m *mesh) natAllowed(p *meshPeer, now time.Time) bool {
+	if now.Before(m.nat.failedLANUntil[p.spec.key]) {
+		return false
+	}
+	delete(m.nat.failedLANUntil, p.spec.key)
+	if now.Before(m.nat.lanUntil[p.spec.key]) {
+		return false
+	}
+	if p.selected != nil && !p.selected.nat && m.fresh(p.selected, now) {
+		return false
+	}
+	for _, c := range p.paths {
+		if !c.nat {
+			if _, ok := m.qualified(p, c, now); ok {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func (m *mesh) closeNAT() error {
@@ -51,6 +87,11 @@ func (m *mesh) natTick(now time.Time) {
 		return
 	}
 	n := m.nat
+	for _, p := range m.peers {
+		if _, ok := n.lanUntil[p.spec.key]; !ok {
+			n.lanUntil[p.spec.key] = now.Add(time.Duration(m.c.NAT.LANFirst))
+		}
+	}
 	for id, s := range n.starts {
 		if now.Sub(s.at) >= 10*time.Second {
 			delete(n.starts, id)
@@ -71,6 +112,13 @@ func (m *mesh) natTick(now time.Time) {
 		n.selected = make(map[wgtypes.Key]netip.AddrPort)
 	}
 	if n.engine == nil {
+		allowed := false
+		for _, p := range m.peers {
+			allowed = allowed || m.natAllowed(p, now)
+		}
+		if !allowed {
+			return
+		}
 		if len(links) == 0 || now.Before(n.retryAt) {
 			return
 		}
@@ -97,6 +145,16 @@ func (m *mesh) natTick(now time.Time) {
 		}
 	}
 	for _, p := range m.peers {
+		if !m.natAllowed(p, now) {
+			continue
+		}
+		changed, err := n.engine.SetExcludedIPs(p.spec.key, m.excludedLAN(p.spec.key, now))
+		if err != nil {
+			continue
+		}
+		if changed {
+			p.signalNext = time.Time{}
+		}
 		if err := n.engine.EnsurePeer(p.spec.key, bytes.Compare(m.public[:], p.spec.key[:]) < 0); err != nil {
 			continue
 		}

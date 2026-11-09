@@ -82,6 +82,7 @@ type iceTraversal struct {
 	mux        *iceFilteredMux
 	urls       []*stun.URI
 	peers      map[wgtypes.Key]*icePeer
+	excluded   map[wgtypes.Key]map[netip.Addr]bool
 	events     chan iceUpdate
 	closed     bool
 	closeDone  chan struct{}
@@ -97,7 +98,7 @@ func newICETraversal(t wireGuardUDP, port uint16, servers []netip.AddrPort, link
 	if t == nil || port == 0 || len(servers) > iceLimit {
 		return nil, errICEInvalid
 	}
-	x := &iceTraversal{conn: newICEPacketConn(t, port), peers: make(map[wgtypes.Key]*icePeer), events: make(chan iceUpdate, 256), closeDone: make(chan struct{}), interfaces: make(map[string]bool), ips: make(map[netip.Addr]bool), broadcasts: make(map[netip.Addr]bool)}
+	x := &iceTraversal{conn: newICEPacketConn(t, port), peers: make(map[wgtypes.Key]*icePeer), excluded: make(map[wgtypes.Key]map[netip.Addr]bool), events: make(chan iceUpdate, 256), closeDone: make(chan struct{}), interfaces: make(map[string]bool), ips: make(map[netip.Addr]bool), broadcasts: make(map[netip.Addr]bool)}
 	factory := logging.NewDefaultLoggerFactory()
 	factory.Writer = io.Discard
 	x.logger = factory
@@ -134,6 +135,49 @@ func newICETraversal(t wireGuardUDP, port uint16, servers []netip.AddrPort, link
 	return x, nil
 }
 
+// SetExcludedIPs runs on the mesh event loop before EnsurePeer. A changed
+// policy replaces an existing agent so it cannot retain old candidate pairs.
+func (x *iceTraversal) SetExcludedIPs(key wgtypes.Key, ips []netip.Addr) (bool, error) {
+	if len(ips) > iceLimit {
+		return false, errICEInvalid
+	}
+	next := make(map[netip.Addr]bool, len(ips))
+	for _, ip := range ips {
+		if !ip.Is4() {
+			return false, errICEInvalid
+		}
+		next[ip] = true
+	}
+	x.mu.Lock()
+	if x.closed {
+		x.mu.Unlock()
+		return false, errICEClosed
+	}
+	old := x.excluded[key]
+	changed := len(old) != len(next)
+	for ip := range next {
+		changed = changed || !old[ip]
+	}
+	p := x.peers[key]
+	if changed {
+		x.excluded[key] = next
+		if p != nil {
+			p.selected, p.paired = netip.AddrPort{}, netip.AddrPort{}
+		}
+	}
+	x.mu.Unlock()
+	if changed && p != nil {
+		return true, x.restart(key, p)
+	}
+	return changed, nil
+}
+
+func (x *iceTraversal) allowedRemoteIP(key wgtypes.Key, ip netip.Addr) bool {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	return x.validRemoteIP(ip) && !x.excluded[key][ip]
+}
+
 func (x *iceTraversal) EnsurePeer(key wgtypes.Key, controlling bool) error {
 	x.mu.Lock()
 	if x.closed {
@@ -166,7 +210,7 @@ func (x *iceTraversal) EnsurePeer(key wgtypes.Key, controlling bool) error {
 func (x *iceTraversal) createAgent(key wgtypes.Key, p *icePeer) error {
 	keep, check, disconnected, failed := time.Second, 200*time.Millisecond, 5*time.Second, 5*time.Second
 	config := &ice.AgentConfig{Urls: x.urls, LocalUfrag: p.local.Ufrag, LocalPwd: p.local.Password, MulticastDNSMode: ice.MulticastDNSModeDisabled, NetworkTypes: []ice.NetworkType{ice.NetworkTypeUDP4}, CandidateTypes: []ice.CandidateType{ice.CandidateTypeHost, ice.CandidateTypeServerReflexive}, UDPMux: x.mux, UDPMuxSrflx: x.mux, KeepaliveInterval: &keep, CheckInterval: &check, DisconnectedTimeout: &disconnected, FailedTimeout: &failed, IncludeLoopback: true, LoggerFactory: x.logger,
-		InterfaceFilter: func(name string) bool { return x.interfaces[name] }, IPFilter: func(ip net.IP) bool { a, ok := netip.AddrFromSlice(ip); return ok && x.ips[a.Unmap()] }, RemoteIPFilter: func(ip net.IP) bool { a, ok := netip.AddrFromSlice(ip); return ok && x.validRemoteIP(a.Unmap()) }}
+		InterfaceFilter: func(name string) bool { return x.interfaces[name] }, IPFilter: func(ip net.IP) bool { a, ok := netip.AddrFromSlice(ip); return ok && x.ips[a.Unmap()] }, RemoteIPFilter: func(ip net.IP) bool { a, ok := netip.AddrFromSlice(ip); return ok && x.allowedRemoteIP(key, a.Unmap()) }}
 	a, err := ice.NewAgent(config)
 	if err != nil {
 		return errors.New("ICE agent creation failed")
@@ -217,7 +261,7 @@ func (x *iceTraversal) createAgent(key wgtypes.Key, p *icePeer) error {
 		}
 		x.mu.Lock()
 		defer x.mu.Unlock()
-		if x.closed || p.epoch != epoch {
+		if x.closed || p.epoch != epoch || x.excluded[key][addr] {
 			return
 		}
 		p.paired = netip.AddrPortFrom(addr, uint16(remote.Port()))
@@ -253,7 +297,7 @@ func (x *iceTraversal) Events() <-chan iceUpdate { return x.events }
 func (x *iceTraversal) Selected(key wgtypes.Key) iceUpdate {
 	x.mu.Lock()
 	defer x.mu.Unlock()
-	if p := x.peers[key]; p != nil && !x.closed && p.agent != nil {
+	if p := x.peers[key]; p != nil && !x.closed && p.agent != nil && !x.excluded[key][p.selected.Addr()] {
 		return iceUpdate{Peer: key, Generation: p.local.Generation, Revision: p.epoch, Endpoint: p.selected, State: p.state}
 	}
 	return iceUpdate{Peer: key}
@@ -328,6 +372,13 @@ func (x *iceTraversal) Remote(key wgtypes.Key, s iceSignal) error {
 	if p == nil {
 		x.mu.Unlock()
 		return errICEInvalid
+	}
+	if candidate != nil {
+		addr, _ := netip.ParseAddr(candidate.Address())
+		if x.excluded[key][addr] {
+			x.mu.Unlock()
+			return errICEInvalid
+		}
 	}
 	if p.agent == nil {
 		x.mu.Unlock()

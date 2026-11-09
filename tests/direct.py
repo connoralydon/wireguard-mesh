@@ -1,11 +1,12 @@
 import json
 import random
+import re
 import shlex
 import sys
 import time
 
 unit = "wireguard-meshd@wg0.service"
-is_nat = mode.startswith("nat-traversal")
+is_nat = mode.startswith("nat-traversal") or mode.startswith("lan-first-")
 is_lan = not is_nat
 short_profile = mode not in ("same-lan-routes", "nat-traversal")
 nodes_by_name = {machine.name: machine for machine in machines}
@@ -43,6 +44,13 @@ def ping():
         machine.succeed(f"ping -n -c 3 -i 0.2 -W 2 10.77.0.{remote}")
 
 
+def tunnel_rtt(machine, remote):
+    output = machine.succeed(f"ping -n -c 9 -i 0.2 -W 2 10.77.0.{remote}")
+    match = re.search(r"=\s*[\d.]+/([\d.]+)/[\d.]+/[\d.]+\s*ms", output)
+    assert match, "Ping did not report an average RTT"
+    return float(match.group(1))
+
+
 def stable():
     for machine in (b, c):
         current = state(machine, "wg0")
@@ -64,26 +72,30 @@ def wait_relay(since=None):
     ping()
 
 
-def wait_direct():
+def wait_direct(timeout=90):
     for machine, remote, peer in ((b, 3, "c"), (c, 2, "b")):
         if mode_kind != "legacy":
-            machine.wait_until_succeeds("mesh-direct-test owned", timeout=90)
+            machine.wait_until_succeeds("mesh-direct-test owned", timeout=timeout)
         interface = "wg0" if mode_kind == "legacy" else machine.succeed("mesh-direct-test owned").strip()
         if mode_kind == "legacy":
-            machine.wait_until_succeeds("test $(wg show wg0 peers | wc -l) -eq 2", timeout=90)
+            machine.wait_until_succeeds("test $(wg show wg0 peers | wc -l) -eq 2", timeout=timeout)
+            # Legacy mode adds the peer before its handshake. Peer presence
+            # alone is not readiness; route mode keeps its separate prewarm
+            # observer and must already have a handshake before promotion.
+            machine.wait_until_succeeds(f"wg show wg0 latest-handshakes | awk -v peer={shlex.quote(public[peer])} '$1 == peer && $2 > 0 {{found=1}} END {{exit !found}}'", timeout=timeout)
         else:
-            machine.wait_until_succeeds(f"ip route get 10.77.0.{remote} | grep -q 'dev {interface}'", timeout=90)
+            machine.wait_until_succeeds(f"ip route get 10.77.0.{remote} | grep -q 'dev {interface}'", timeout=timeout)
         current = state(machine, interface)
-        assert current["allowed-ips"][public[peer]] == f"10.77.0.{remote}/32"
-        assert int(current["latest-handshakes"][public[peer]]) > 0
-        if is_nat:
+        assert current["allowed-ips"][public[peer]] == f"10.77.0.{remote}/32", "Incorrect direct allowed IPs"
+        assert int(current["latest-handshakes"][public[peer]]) > 0, "Direct peer has no WireGuard handshake"
+        if is_nat and not mode.startswith("lan-first-"):
             address = 3 if mode == "nat-traversal-one-nat" and peer == "c" else (13 if peer == "c" else 12)
             assert current["endpoints"][public[peer]] == f"192.0.2.{address}:{nat_ports[peer]}"
         if mode == "same-lan-stun-down":
             assert current["endpoints"][public[peer]].startswith(f"172.20.2.{remote}:")
     record("direct-route-observed", path=mode_kind)
     for machine in (b, c):
-        machine.wait_until_succeeds("mesh-direct-test active", timeout=90)
+        machine.wait_until_succeeds("mesh-direct-test active", timeout=timeout)
         if mode == "same-lan-stun-down":
             remote = 3 if machine.name == "b" else 2
             machine.succeed(f"mesh-direct-test active 172.20.2.{remote}:51823")
@@ -112,12 +124,13 @@ def drop(enable, both=False):
     record("drop-on" if enable else "drop-off", both=both, path=mode_kind)
 
 
-def start_watch():
+def start_watch(timeout=120):
     global watch_generation
     watch_generation += 1
     for machine, remote, peer in ((b, 3, "c"), (c, 2, "b")):
-        machine.succeed("rm -f /tmp/mesh-artifacts/route-watch.json")
-        machine.succeed(f"systemd-run --collect --unit=mesh-watch-{watch_generation} {guest_helper} watch-route 10.77.0.{remote} {public[peer]}")
+        machine.succeed("rm -f /tmp/mesh-artifacts/route-watch.json /tmp/mesh-route-watch-ready")
+        machine.succeed(f"systemd-run --collect --unit=mesh-watch-{watch_generation} {kernel_observer} -mode route -remote 10.77.0.{remote} -peer {public[peer]} -timeout {timeout}s -output /tmp/mesh-artifacts/route-watch.json -ready /tmp/mesh-route-watch-ready")
+        machine.wait_until_succeeds("test -e /tmp/mesh-route-watch-ready", timeout=30)
 
 
 def check_watch():
@@ -225,7 +238,107 @@ def summarize(samples, start, end):
              "mean_rtt_ms": sum(rtts) / len(rtts) if rtts else None,
             "median_rtt_ms": rtts[len(rtts) // 2] if rtts else None,
             "p95_rtt_ms": rtts[min(len(rtts) - 1, (len(rtts) * 95 + 99) // 100 - 1)] if rtts else None,
-            "tcp_connections": sorted({item["connection"] for item in selected if "connection" in item})}
+             "tcp_connections": sorted({item["connection"] for item in selected if "connection" in item})}
+
+
+def rosenpass_profile():
+    adapter = "wireguard-mesh-rosenpass@wg0.service"
+    if is_nat:
+        start_stun("mesh-stun")
+    for machine in (b, c):
+        machine.succeed(f"mesh-direct-test rp-setup {machine.name}")
+    # Rosenpass public keys exceed shell argument limits. Transfer the public
+    # files through the shared directory; private keys and PSKs stay in the VMs.
+    for machine in (b, c):
+        machine.copy_from_machine("/var/lib/mesh-rosenpass-wg0/public", f"rp-public/{machine.name}")
+    for machine, peer, remote in ((b, "c", 3), (c, "b", 2)):
+        machine.copy_from_host(str(machine.out_dir / "rp-public" / peer / "public"), "/var/lib/mesh-rosenpass-wg0/peer-public")
+        machine.succeed("chmod 0444 /var/lib/mesh-rosenpass-wg0/peer-public")
+        machine.succeed(f"systemd-run --unit=mesh-no-route-watch --property=KillMode=mixed --property=RuntimeMaxSec=120 {guest_helper} watch-no-route 10.77.0.{remote} {public[peer]}")
+        machine.wait_until_succeeds("test -e /tmp/mesh-no-route-watch-ready", timeout=30)
+        machine.succeed(f"systemctl start {unit}")
+    time.sleep(20)
+    wait_relay()
+    for machine in (b, c):
+        machine.succeed("systemctl show mesh-no-route-watch -p PartOf,Requires,BindsTo,PropagatesStopTo")
+        machine.succeed("systemctl stop mesh-no-route-watch")
+        machine.wait_until_succeeds("test -s /tmp/mesh-artifacts/no-route-watch.json", timeout=30)
+        observed = json.loads(machine.succeed("cat /tmp/mesh-artifacts/no-route-watch.json"))
+        assert observed["stopped"] and not observed["host_route_seen"] and not observed["handshake_seen"], observed
+    pids = {machine.name: machine.succeed(f"systemctl show {unit} -p MainPID --value").strip() for machine in (b, c)}
+    start_watch()
+    for machine in (b, c):
+        machine.succeed(f"systemctl start {adapter}")
+        machine.wait_for_unit(adapter)
+    wait_direct()
+    check_watch()
+    for machine, peer, local in ((b, "c", 2), (c, "b", 3)):
+        machine.wait_until_succeeds(f"mesh-direct-test rp-check {peer}", timeout=30)
+        machine.succeed(f"ss -lun | grep -q '10.77.0.{local}:51822'")
+        machine.succeed("test $(iptables -L MESH_RP_VPN -nvx | awk '/RETURN/ {print $1}') -gt 0")
+        machine.succeed("mesh-direct-test rp-mark")
+    roles = {machine.name: json.loads(machine.succeed("mesh-direct-test rp-initial-role"))["initiator"] for machine in (b, c)}
+    assert set(roles.values()) == {True, False}, "Both Rosenpass processes initiated at startup"
+    record("rosenpass-initial-roles", roles=roles)
+    record("rosenpass-direct")
+    if is_nat:
+        for machine, remote, peer in ((b, 3, "c"), (c, 2, "b")):
+            machine.succeed(f"systemd-run --unit=mesh-rp-rekey-watch --property=RuntimeMaxSec=210 {kernel_observer} -mode rekey -remote 10.77.0.{remote} -peer {public[peer]} -timeout 200s -output /tmp/mesh-artifacts/rp-rekey-watch.json -ready /tmp/mesh-rp-watch-ready -old-key-file /run/mesh-rp-test-key -key-file /run/wireguard-mesh-rosenpass-wg0/peer.psk")
+            machine.wait_until_succeeds("test -e /tmp/mesh-rp-watch-ready", timeout=30)
+        for machine in (b, c):
+            machine.wait_until_succeeds("test -s /tmp/mesh-artifacts/rp-rekey-watch.json", timeout=210)
+            result = json.loads(machine.succeed("cat /tmp/mesh-artifacts/rp-rekey-watch.json"))
+            assert all(result.values()), result
+        wait_direct()
+        for machine, peer in ((b, "c"), (c, "b")):
+            machine.succeed(f"mesh-direct-test rp-check {peer}")
+            machine.succeed("mesh-direct-test rp-mark")
+        record("rosenpass-natural-rotation")
+    for machine in (b, c):
+        machine.succeed(f"systemctl show {adapter} -p PartOf,Requires,BindsTo,PropagatesStopTo")
+        machine.succeed(f"systemctl stop {adapter}")
+        machine.succeed("mesh-direct-test rp-orphan")
+    wait_relay()
+    progress = {machine.name: probe_progress(machine)["udp"]["seq"] for machine in (b, c)}
+    time.sleep(8)
+    for machine, remote in ((b, 3), (c, 2)):
+        machine.succeed(f"test -z \"$(ip -4 route show exact 10.77.0.{remote}/32)\"")
+        assert machine.succeed(f"systemctl show {unit} -p MainPID --value").strip() == pids[machine.name]
+    record("rosenpass-orphan-rejected")
+    start_watch()
+    for machine in (b, c):
+        machine.succeed(f"systemctl start {adapter}")
+        machine.wait_for_unit(adapter)
+    wait_direct()
+    check_watch()
+    for machine, peer in ((b, "c"), (c, "b")):
+        machine.wait_until_succeeds(f"mesh-direct-test rp-check {peer}", timeout=30)
+        machine.succeed("mesh-direct-test rp-changed")
+        machine.wait_until_succeeds(f"mesh-direct-test probe-udp-after {progress[machine.name]}", timeout=30)
+        assert machine.succeed(f"systemctl show {unit} -p MainPID --value").strip() == pids[machine.name]
+    if not is_nat:
+        # A restarted listener must also recover when the other Rosenpass
+        # process stays alive. Its native rekey timer can take 130 seconds.
+        listener = next(machine for machine in (b, c) if not roles[machine.name])
+        for machine in (b, c):
+            machine.succeed("mesh-direct-test rp-mark")
+        listener.succeed(f"systemctl show {adapter} -p PartOf,Requires,BindsTo,PropagatesStopTo")
+        listener.succeed(f"systemctl stop {adapter}")
+        wait_relay()
+        start_watch(timeout=180)
+        listener.succeed(f"systemctl start {adapter}")
+        listener.wait_for_unit(adapter)
+        wait_direct(timeout=180)
+        check_watch()
+        for machine, peer in ((b, "c"), (c, "b")):
+            machine.succeed(f"mesh-direct-test rp-check {peer}")
+            machine.succeed("mesh-direct-test rp-changed")
+            assert machine.succeed(f"systemctl show {unit} -p MainPID --value").strip() == pids[machine.name]
+        record("rosenpass-listener-restarted", machine=listener.name)
+    stop_daemons()
+    for machine in (b, c):
+        machine.succeed(f"systemctl show {adapter} -p PartOf,Requires,BindsTo,PropagatesStopTo")
+        machine.succeed(f"systemctl stop {adapter}")
 
 
 try:
@@ -244,6 +357,107 @@ try:
     wait_relay()
     for machine in (b, c):
         machine.wait_until_succeeds("test -e /tmp/mesh-probe-tcp-ready", timeout=30)
+    if mode in ("same-lan-rosenpass-routes", "nat-traversal-rosenpass"):
+        rosenpass_profile()
+        raise ProfileComplete()
+    if mode.startswith("lan-first-"):
+        wg_blocked = mode == "lan-first-wg-blocked"
+        start_stun("mesh-stun")
+        for machine in (b, c):
+            # Count direct-port packets on the NAT-facing interface only.
+            machine.succeed("iptables -N MESH_ICE_COUNT")
+            machine.succeed("iptables -A OUTPUT -o lan -p udp --sport 51821 -j MESH_ICE_COUNT")
+            machine.succeed("iptables -A MESH_ICE_COUNT -j RETURN")
+            for label, interface in (("LAN", "pairlan"), ("WAN", "lan")):
+                chain = "MESH_WG_DATA_" + label
+                machine.succeed(f"iptables -N {chain}")
+                machine.succeed(f"iptables -A OUTPUT -o {interface} -p udp --sport 51821 -m u32 --u32 '0>>22&0x3C@8=0x04000000' -j {chain}")
+                machine.succeed(f"iptables -A {chain} -j RETURN")
+            if wg_blocked:
+                machine.succeed("mesh-direct-test pairlan-wg-block on")
+                machine.succeed("iptables -N MESH_LAN_CONTROL")
+                machine.succeed("iptables -A INPUT -i pairlan -p udp --dport 51823 -j MESH_LAN_CONTROL")
+                machine.succeed("iptables -A MESH_LAN_CONTROL -j RETURN")
+        configs = {machine.name: machine.succeed("sha256sum /etc/wireguard-mesh/wg0.json").strip() for machine in (b, c)}
+        if wg_blocked:
+            started = time.monotonic()
+            start_watch()
+            for machine in (b, c):
+                machine.succeed(f"systemctl start {unit}")
+                machine.wait_for_unit(unit)
+            before = daemon_snapshot()
+        else:
+            start_daemons()
+            for machine, remote in ((b, 3), (c, 2)):
+                machine.wait_until_succeeds(f"mesh-direct-test active 172.21.4.{remote}:51823", timeout=90)
+            time.sleep(13)
+            for machine in (b, c):
+                machine.succeed("test $(iptables -L MESH_ICE_COUNT -nvx | awk '/RETURN/ {print $1}') -eq 0")
+            before = daemon_snapshot()
+            for machine in (b, c):
+                machine.succeed("ip link set pairlan down")
+            record("pairlan-down")
+            wait_relay()
+        for machine, remote, peer in ((b, 3, "c"), (c, 2, "b")):
+            remaining = max(1, int(120 - (time.monotonic() - started))) if wg_blocked else 120
+            machine.wait_until_succeeds(f"mesh-direct-test active 192.0.2.{13 if peer == 'c' else 12}:{nat_ports[peer]}", timeout=remaining)
+        wait_direct()
+        if wg_blocked:
+            assert time.monotonic() - started <= 120, "NAT direct path took more than 120 seconds"
+            check_watch()
+            for machine, remote in ((b, 3), (c, 2)):
+                machine.succeed("ip link show pairlan | grep -q 'UP'")
+                counts = json.loads(machine.succeed("mesh-direct-test wg-blocked-counter"))
+                assert sum(counts[:2]) > 0, "No LAN WireGuard handshake packets were blocked"
+                machine.succeed("test $(iptables -L MESH_LAN_CONTROL -nvx | awk '/RETURN/ {print $1}') -gt 0")
+                machine.succeed(f"mesh-direct-test no-lan-trial {remote}")
+                record("pairlan-wireguard-blocked", machine=machine.name, counters=counts)
+        for machine, peer in ((b, "c"), (c, "b")):
+            interface = machine.succeed("mesh-direct-test owned").strip()
+            assert state(machine, interface)["endpoints"][public[peer]] == f"192.0.2.{13 if peer == 'c' else 12}:{nat_ports[peer]}"
+        nat_rtt = {machine.name: tunnel_rtt(machine, remote) for machine, remote in ((b, 3), (c, 2))}
+        for machine, peer in ((b, "c"), (c, "b")):
+            interface = machine.succeed("mesh-direct-test owned").strip()
+            assert state(machine, interface)["endpoints"][public[peer]] == f"192.0.2.{13 if peer == 'c' else 12}:{nat_ports[peer]}"
+        if wg_blocked:
+            for machine in (b, c):
+                machine.succeed("mesh-direct-test pairlan-wg-block off")
+                machine.succeed("ip link set pairlan down")
+            record("pairlan-down")
+            time.sleep(2)
+        for machine in (b, c):
+            machine.succeed("tc qdisc add dev pairlan root netem delay 10ms")
+            machine.succeed("ip link set pairlan up")
+        record("pairlan-up")
+        for machine, remote in ((b, 3), (c, 2)):
+            machine.wait_until_succeeds(f"mesh-direct-test active 172.21.4.{remote}:51823", timeout=120)
+        wait_direct()
+        for machine, remote, peer in ((b, 3, "c"), (c, 2, "b")):
+            interface = machine.succeed("mesh-direct-test owned").strip()
+            expected = f"172.21.4.{remote}:51821"
+            endpoint_line = shlex.quote(public[peer] + "\t" + expected)
+            machine.wait_until_succeeds(f"wg show {interface} endpoints | tee /dev/stderr | grep -Fqx -- {endpoint_line}", timeout=10)
+            actual = state(machine, interface)["endpoints"][public[peer]]
+            assert actual == expected, {"expected": expected, "actual": actual}
+            def data_counts():
+                return {label: int(machine.succeed(f"iptables -L MESH_WG_DATA_{label} -nvx | awk '/RETURN/ {{print $1}}'"))
+                        for label in ("LAN", "WAN")}
+            data_before = data_counts()
+            lan_rtt = tunnel_rtt(machine, remote)
+            data_after = data_counts()
+            record("lan-priority-transport", machine=machine.name, before=data_before, after=data_after)
+            assert data_after["LAN"] > data_before["LAN"], "No WireGuard transport packets used the LAN"
+            assert data_after["WAN"] == data_before["WAN"], "WireGuard transport packets still used the WAN"
+            record("lan-priority-rtt", machine=machine.name, nat_ms=nat_rtt[machine.name], lan_ms=lan_rtt)
+            assert lan_rtt > nat_rtt[machine.name] + 5, "LAN RTT was not at least 5ms slower than NAT"
+            actual = state(machine, interface)["endpoints"][public[peer]]
+            assert actual == expected, {"expected": expected, "actual": actual}
+        after = daemon_snapshot()
+        for machine in (b, c):
+            assert after[machine.name][0] == before[machine.name][0], "mesh daemon restarted"
+            assert machine.succeed("sha256sum /etc/wireguard-mesh/wg0.json").strip() == configs[machine.name], "configuration changed"
+        stop_daemons()
+        raise ProfileComplete()
     if short_profile and is_lan:
         start_daemons()
         before = daemon_snapshot()
@@ -281,7 +495,7 @@ try:
             machine.succeed(f"systemd-run --unit=mesh-headers --property=RuntimeMaxSec=120 --property=StandardOutput=append:/tmp/mesh-artifacts/underlay-headers.txt {tcpdump} -nn -l -i {capture_interface} udp port 3478")
             if mode == "nat-traversal-wg-blocked":
                 remote, peer = (3, "c") if machine.name == "b" else (2, "b")
-                machine.succeed(f"systemd-run --unit=mesh-no-route-watch --property=RuntimeMaxSec=120 {guest_helper} watch-no-route 10.77.0.{remote} {public[peer]}")
+                machine.succeed(f"systemd-run --unit=mesh-no-route-watch --property=KillMode=mixed --property=RuntimeMaxSec=120 {guest_helper} watch-no-route 10.77.0.{remote} {public[peer]}")
                 machine.wait_until_succeeds("test -e /tmp/mesh-no-route-watch-ready", timeout=30)
         for machine in (b, c):
             machine.succeed(f"systemctl start {unit}")
@@ -408,6 +622,11 @@ except ProfileComplete:
 finally:
     failed = sys.exc_info()[0] is not None
     tcp_errors = []
+    if mode in ("same-lan-rosenpass-routes", "nat-traversal-rosenpass"):
+        for machine in (b, c):
+            for service in ("mesh-rp-rekey-watch", "mesh-no-route-watch", "wireguard-mesh-rosenpass@wg0.service"):
+                machine.execute(f"systemctl show {service} -p PartOf,Requires,BindsTo,PropagatesStopTo", timeout=15)
+                machine.execute(f"systemctl stop {service}", timeout=15)
     if not failed:
         # Wait for a new echo, not just route convergence or a fixed delay.
         after = time.time()

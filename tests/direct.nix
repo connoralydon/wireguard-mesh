@@ -1,6 +1,31 @@
 { pkgs, mesh }:
 let
   inherit (pkgs) lib;
+  observer = pkgs.buildGo126Module {
+    pname = "mesh-kernel-observer";
+    version = "0.1.0";
+    src = lib.cleanSourceWith {
+      src = ../.;
+      filter =
+        path: type:
+        type == "directory"
+        || (
+          type == "regular"
+          && (
+            lib.hasSuffix ".go" path
+            || builtins.elem (baseNameOf path) [
+              "go.mod"
+              "go.sum"
+            ]
+          )
+        );
+    };
+    vendorHash = "sha256-tMVVz858VrtYThmTdafY/HEmpWWfYFSe/T6VqK+HnOU=";
+    subPackages = [ "tests/observer" ];
+    postInstall = ''
+      mv "$out/bin/observer" "$out/bin/mesh-kernel-observer"
+    '';
+  };
   unit = pkgs.runCommand "mesh-direct-test-unit" { } ''
     mkdir -p $out/lib/systemd/system
     cp ${
@@ -10,6 +35,14 @@ let
         )
       )
     } $out/lib/systemd/system/wireguard-meshd@.service
+    cp ${
+      pkgs.writeText "wireguard-mesh-rosenpass@.service" (
+        lib.replaceStrings
+          [ "wireguard-meshd -" "ExecStartPre=install " ]
+          [ "${mesh}/bin/wireguard-meshd -" "ExecStartPre=${pkgs.coreutils}/bin/install " ]
+          (builtins.readFile (../. + "/wireguard-mesh-rosenpass@.service"))
+      )
+    } $out/lib/systemd/system/wireguard-mesh-rosenpass@.service
   '';
   guest = pkgs.writeScriptBin "mesh-direct-test" ''
     #!${pkgs.python3}/bin/python3
@@ -22,6 +55,8 @@ let
         pkgs.systemd
         pkgs.coreutils
         pkgs.conntrack-tools
+        pkgs.util-linux
+        pkgs.rosenpass
       ]
     }"
     ${builtins.readFile ./direct_guest.py}
@@ -47,9 +82,11 @@ let
   make =
     mode:
     let
-      isNat = lib.hasPrefix "nat-traversal" mode;
+      isNat = lib.hasPrefix "nat-traversal" mode || lib.hasPrefix "lan-first-" mode;
       isLan = !isNat;
       oneNat = mode == "nat-traversal-one-nat";
+      pairLan = lib.hasPrefix "lan-first-" mode;
+      isRosenpass = lib.hasSuffix "rosenpass-routes" mode || mode == "nat-traversal-rosenpass";
     in
     pkgs.testers.runNixOSTest {
       name = "wireguard-mesh-${mode}";
@@ -67,6 +104,7 @@ let
         environment.systemPackages = [
           mesh
           guest
+          observer
           pkgs.wireguard-tools
           pkgs.iproute2
           pkgs.iptables
@@ -80,10 +118,35 @@ let
           "net.ipv4.conf.default.rp_filter" = 2;
         };
         systemd.packages = [ unit ];
+        users.groups = lib.mkIf isRosenpass {
+          mesh-wg0 = { };
+          mesh-psk-wg0 = { };
+        };
+        users.users = lib.mkIf isRosenpass {
+          mesh-wg0 = {
+            isSystemUser = true;
+            uid = 991;
+            group = "mesh-wg0";
+            extraGroups = [ "mesh-psk-wg0" ];
+          };
+          mesh-rosenpass-wg0 = {
+            isSystemUser = true;
+            group = "mesh-psk-wg0";
+          };
+        };
+        systemd.services."wireguard-mesh-rosenpass@wg0" = lib.mkIf isRosenpass {
+          overrideStrategy = "asDropin";
+          serviceConfig.Restart = "no";
+        };
         systemd.services."wireguard-meshd@wg0" = {
           overrideStrategy = "asDropin";
           serviceConfig = {
             RestartSec = "15s";
+          }
+          // lib.optionalAttrs isRosenpass {
+            DynamicUser = lib.mkForce false;
+            User = "mesh-wg0";
+            SupplementaryGroups = [ "mesh-psk-wg0" ];
           }
           // lib.optionalAttrs (isNat || mode == "same-lan-stun-down") {
             CapabilityBoundingSet = lib.mkForce [
@@ -107,20 +170,24 @@ let
           virtualisation.interfaces = {
             lan.vlan = 2;
           }
+          // lib.optionalAttrs pairLan { pairlan.vlan = 4; }
           // lib.optionalAttrs isLan { wan.vlan = 1; };
           networking.interfaces = {
             lan.ipv4.addresses = address "172.20.2.2";
           }
+          // lib.optionalAttrs pairLan { pairlan.ipv4.addresses = address "172.21.4.2"; }
           // lib.optionalAttrs isLan { wan.ipv4.addresses = address "192.0.2.2"; };
         };
         c = {
           virtualisation.interfaces = {
             lan.vlan = if isNat then 3 else 2;
           }
+          // lib.optionalAttrs pairLan { pairlan.vlan = 4; }
           // lib.optionalAttrs (isLan || oneNat) { wan.vlan = 1; };
           networking.interfaces = {
             lan.ipv4.addresses = address (if isNat then "172.20.3.3" else "172.20.2.3");
           }
+          // lib.optionalAttrs pairLan { pairlan.ipv4.addresses = address "172.21.4.3"; }
           // lib.optionalAttrs (isLan || oneNat) { wan.ipv4.addresses = address "192.0.2.3"; };
         };
       }
@@ -134,7 +201,9 @@ let
         mode = "${mode}"
         turnserver = "${pkgs.coturn}/bin/turnserver"
         guest_helper = "${guest}/bin/mesh-direct-test"
+        kernel_observer = "${observer}/bin/mesh-kernel-observer"
         tcpdump = "${pkgs.tcpdump}/bin/tcpdump"
+        rosenpass = "${pkgs.rosenpass}/bin/rosenpass"
         ${builtins.readFile ./direct.py}
       '';
     };
@@ -151,4 +220,8 @@ lib.genAttrs [
   "nat-traversal-stun-failover"
   "nat-traversal-one-nat"
   "nat-traversal-long-outage"
+  "lan-first-nat-fallback"
+  "lan-first-wg-blocked"
+  "same-lan-rosenpass-routes"
+  "nat-traversal-rosenpass"
 ] make

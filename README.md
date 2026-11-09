@@ -1,8 +1,8 @@
 # wireguard-mesh
 
-`wireguard-meshd` is a Linux Go service for direct LAN pairing between trusted WireGuard nodes. New version 2 configurations use an automatically owned direct WireGuard interface and establish the handshake before moving traffic. Optional IPv4 NAT traversal uses Pion ICE and is experimental. See [NAT.md](NAT.md) for setup and [PLAN.md](PLAN.md) for the original LAN design.
+`wireguard-meshd` is a Linux Go service for direct LAN pairing between trusted WireGuard nodes. New version 2 configurations use an automatically owned direct WireGuard interface and establish the handshake before moving traffic. Optional IPv4 NAT traversal uses Pion ICE and is experimental. Optional Rosenpass supplies PSKs for both direct paths. See [NAT.md](NAT.md) and [ROSENPASS.md](ROSENPASS.md) for setup, and [PLAN.md](PLAN.md) for the original LAN design.
 
-**Status:** All 18 `x86_64-linux` QEMU checks pass, including eleven LAN/NAT profiles and seven existing regression checks. Go tests, race checks, vet, and fuzz checks also pass. See [tests/README.md](tests/README.md) for measurements and limits. Hole punching and in-place rekey remain experimental; a handshake timestamp does not prove which PSK established it. An independent security review is still required before production use.
+**Status:** All 22 `x86_64-linux` QEMU checks passed, including Rosenpass on both direct paths, strict LAN-first selection, key rotation, and hub fallback. Go tests, race checks, vet, and fuzz checks also passed. See [tests/README.md](tests/README.md) for results and limits. Hole punching and in-place rekey remain experimental; a handshake timestamp alone does not prove which PSK established it. An independent security review is still required before production use.
 
 Wireguard is an incredible VPN. One issue is that peers and routes are statically defined.
 
@@ -116,7 +116,7 @@ Probe intervals must be 100 ms–1 s. The window must be at least three probe in
 
 At least 80% of the window's expected probes must produce responses. A path must meet both improvement thresholds. The lower public key coordinates a trial, so simultaneous discoveries do not start competing trials.
 
-LAN UDP RTT is only an estimate. The daemon first qualifies that estimate against the current tunnel path, then tests the actual direct WireGuard route for a complete window. Both nodes must confirm the result. During a direct connection, tunnel probes measure the direct path, not a fresh hub baseline.
+LAN UDP RTT is only an estimate. The daemon first qualifies that estimate against the current tunnel path, then tests the actual direct WireGuard route for a complete window. Both nodes must confirm the result. During a direct connection, ordinary tunnel probes measure the direct path. With NAT traversal enabled, separate hub probes give new LAN candidates a fresh hub baseline. A healthy LAN path takes priority over NAT, even when NAT has a lower RTT. See [NAT.md](NAT.md) for retry and endpoint checks.
 
 To replace an active direct path, the daemon compares the candidate's LAN UDP RTT with the active path's LAN UDP RTT. Equal address aliases do not qualify because of WireGuard overhead. A pending replacement keeps the active route, health probes, and approvals unchanged. A refused proposal, missing coordination messages, or a failed candidate cancels only the pending replacement. The old route stays installed while it remains healthy. A key transition cancels the pending replacement before the existing key policy runs.
 
@@ -154,7 +154,7 @@ The watchdog covers an unresponsive daemon. `ExecStopPost` runs journal recovery
 
 ### Rosenpass And Runtime Keys
 
-Rosenpass support is optional. The separate, unprivileged adapter supports **Rosenpass 0.2.3** and one mesh peer per node. Discovery supplies an authenticated LAN address before a PSK exists. The adapter does not use the hub's Rosenpass process.
+Rosenpass support is optional. The separate, unprivileged adapter supports **Rosenpass 0.2.3** and one mesh peer per node. In route mode, Rosenpass exchanges keys inside the existing VPN before LAN or NAT direct routing. Legacy mode uses an authenticated LAN address from discovery. The adapter does not use the hub's Rosenpass process.
 
 An existing valid PSK is reused. Normal Rosenpass rekeys do not restart the process. Endpoint changes, process failure, expiry, and `stale` events invalidate its output. Both nodes must confirm key possession before a direct-path change. The PSK is not sent through discovery.
 
@@ -201,7 +201,7 @@ IPv6 link-local discovery is available, but link-local **WireGuard endpoints** a
 
 See [PERFORMANCE.md](PERFORMANCE.md) for measured CPU changes and validation limits.
 
-Run these commands on an authorized Linux test machine. The flake pins nixpkgs and includes a daemon package, a development shell, and seven isolated QEMU checks. `flake.lock` and the Go vendor hash are verified build inputs.
+Run these commands on an authorized Linux test machine. The flake pins nixpkgs and includes a daemon package, a development shell, and 22 isolated QEMU checks. `flake.lock` and the Go vendor hash are verified build inputs.
 
 Build the daemon:
 
@@ -209,7 +209,7 @@ Build the daemon:
 nix build path:.#packages.x86_64-linux.default
 ```
 
-Run the QEMU/KVM tests:
+Run the seven original QEMU/KVM regression checks. The [test guide](tests/README.md#route-and-nat-checks) lists the other fifteen route and NAT checks:
 
 ```sh
 nix build --no-link --print-out-paths -L --max-jobs 1 \

@@ -278,6 +278,74 @@ func TestICETraversalInvalidCandidatesAndBounds(t *testing.T) {
 	}
 }
 
+func TestICEExcludedRemoteCannotBeSelected(t *testing.T) {
+	nodes, _, keys := iceTestPair(t)
+	x, key := nodes[0], keys[1]
+	ip := netip.MustParseAddr("127.0.0.1")
+	before := x.Signals(key)[0]
+	changed, err := x.SetExcludedIPs(key, []netip.Addr{ip})
+	if err != nil || !changed {
+		t.Fatalf("set exclusion: changed %v, error %v", changed, err)
+	}
+	after := x.Signals(key)[0]
+	if before.Generation != after.Generation || before.Ufrag != after.Ufrag {
+		t.Fatal("policy change replaced local generation")
+	}
+	if x.allowedRemoteIP(key, ip) || !x.allowedRemoteIP(key, netip.MustParseAddr("192.0.2.13")) {
+		t.Fatal("remote IP filter did not apply per-peer policy")
+	}
+	s := nodes[1].Signals(keys[0])[0]
+	s.Candidate = "1 1 udp 2130706431 127.0.0.1 51901 typ host"
+	if x.Remote(key, s) == nil {
+		t.Fatal("excluded signaled candidate accepted")
+	}
+	x.mu.Lock()
+	x.peers[key].selected = netip.MustParseAddrPort("127.0.0.1:51901")
+	x.mu.Unlock()
+	if x.Selected(key).Endpoint.IsValid() {
+		t.Fatal("snapshot returned excluded endpoint")
+	}
+}
+
+func TestICEExclusionReplacementReconnects(t *testing.T) {
+	nodes, transports, keys := iceTestPair(t)
+	connect := func() {
+		t.Helper()
+		deadline := time.Now().Add(8 * time.Second)
+		for time.Now().Before(deadline) {
+			if err := iceExchange(nodes, keys, false); err != nil {
+				t.Fatal(err)
+			}
+			if nodes[0].Selected(keys[1]).Endpoint.IsValid() && nodes[1].Selected(keys[0]).Endpoint.IsValid() {
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		t.Fatal("replacement agents did not reconnect")
+	}
+	connect()
+	local := nodes[0].Signals(keys[1])[0]
+	// Change one side only. The other agent must accept checks and candidates
+	// after replacement without a reciprocal generation/restart loop.
+	if _, err := nodes[0].SetExcludedIPs(keys[1], []netip.Addr{netip.MustParseAddr("192.0.2.99")}); err != nil {
+		t.Fatal(err)
+	}
+	connect()
+	if _, err := nodes[0].SetExcludedIPs(keys[1], nil); err != nil {
+		t.Fatal(err)
+	}
+	connect()
+	if nodes[0].Signals(keys[1])[0] != local {
+		t.Fatal("policy replacement changed local credentials")
+	}
+	for i, node := range nodes {
+		want := transports[1-i].conn.LocalAddr().(*net.UDPAddr).AddrPort()
+		if node.Selected(keys[1-i]).Endpoint != want {
+			t.Fatal("replacement selected an old or incorrect endpoint")
+		}
+	}
+}
+
 func TestICESignalFitsNoiseBody(t *testing.T) {
 	nodes, _, keys := iceTestPair(t)
 	deadline := time.Now().Add(time.Second)

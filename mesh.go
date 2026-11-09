@@ -23,6 +23,8 @@ type routeControl interface {
 	Check() error
 }
 
+var errEndpointRoamed = errors.New("WireGuard endpoint changed during update")
+
 type message struct {
 	Op        string     `json:"op"`
 	Token     string     `json:"token"`
@@ -81,6 +83,7 @@ type path struct {
 	incoming [16]byte
 	port     uint16
 	lastPong time.Time
+	retryAt  time.Time
 	stats    measurements
 }
 
@@ -100,6 +103,8 @@ type probe struct {
 	session   [16]byte
 	multicast bool
 	measure   bool
+	ifIndex   int
+	hub       bool
 }
 
 // An uncommitted replacement must not change the active route or its health state.
@@ -114,7 +119,7 @@ type routeProposal struct {
 type routeState struct {
 	selected                         *path
 	phase, trial                     string
-	since, resumed                   time.Time
+	since, resumed, endpointSince    time.Time
 	baseline                         time.Duration
 	localGood, remoteGood, committed bool
 	remoteRekey                      bool
@@ -146,6 +151,7 @@ type meshPeer struct {
 	signalToken    string
 	natOffer       netip.AddrPort
 	natOfferAt     time.Time
+	hub            measurements
 }
 
 type mesh struct {
@@ -410,13 +416,17 @@ func (m *mesh) receivePacket(packet packet, now time.Time, raw bool) error {
 		}
 	case "pong":
 		q, ok := p.pending[msg.Token]
-		if !ok || q.session != event.ID || now.Sub(q.at) > time.Duration(m.c.Failure) || (q.path == nil) != tunnel || q.path != candidate {
+		if !ok || q.session != event.ID || now.Sub(q.at) > time.Duration(m.c.Failure) || (q.path == nil) != tunnel || q.path != candidate || tunnel && q.ifIndex != packet.IfIndex {
 			return nil
 		}
 		delete(p.pending, msg.Token)
 		if tunnel {
-			p.tunnel.add(now, now.Sub(q.at), time.Duration(m.c.Window))
-			p.lastTunnel = now
+			if q.hub {
+				p.hub.add(now, now.Sub(q.at), time.Duration(m.c.Window))
+			} else {
+				p.tunnel.add(now, now.Sub(q.at), time.Duration(m.c.Window))
+				p.lastTunnel = now
+			}
 		} else {
 			candidate.session, candidate.port = event.ID, msg.Port
 			if raw {
@@ -470,11 +480,15 @@ func (m *mesh) send(id [16]byte, msg message, addr netip.AddrPort, link linkAddr
 }
 
 func (m *mesh) ping(p *meshPeer, candidate *path, id [16]byte, multicast bool, now time.Time) {
+	m.probePath(p, candidate, id, multicast, false, now)
+}
+
+func (m *mesh) probePath(p *meshPeer, candidate *path, id [16]byte, multicast, hub bool, now time.Time) {
 	if len(p.pending) >= 2048 {
 		return
 	}
 	addr, link := netip.AddrPortFrom(p.spec.IP, m.c.Port), m.tunnel
-	if candidate == nil && m.directTunnel.Index > 0 && (p.phase == "trial" || p.phase == "active") {
+	if !hub && candidate == nil && m.directTunnel.Index > 0 && (p.phase == "trial" || p.phase == "active") {
 		link = m.directTunnel
 	}
 	if candidate != nil {
@@ -489,7 +503,7 @@ func (m *mesh) ping(p *meshPeer, candidate *path, id [16]byte, multicast bool, n
 		sent = m.send(id, msg, addr, link, now)
 	}
 	if sent {
-		p.pending[token] = probe{candidate, now, id, multicast, candidate == nil || id == candidate.session}
+		p.pending[token] = probe{path: candidate, at: now, session: id, multicast: multicast, measure: candidate == nil || id == candidate.session, ifIndex: link.Index, hub: hub}
 	}
 }
 
@@ -508,6 +522,12 @@ func (m *mesh) fresh(c *path, now time.Time) bool {
 }
 
 func (m *mesh) qualified(p *meshPeer, c *path, now time.Time) (time.Duration, bool) {
+	if m.nat != nil && (now.Before(c.retryAt) || c.nat && now.Before(m.nat.failedLAN[p.spec.key][c.addr.Addr().Unmap()])) {
+		return 0, false
+	}
+	if c.nat && m.nat != nil && !m.natAllowed(p, now) {
+		return 0, false
+	}
 	// Apply the LAN preference to received proposals as well as local choices.
 	// ICE must not displace an active, healthy normal LAN path.
 	if p.phase == "active" && p.selected != nil && !p.selected.nat && c.nat && m.fresh(p.selected, now) {
@@ -519,15 +539,66 @@ func (m *mesh) qualified(p *meshPeer, c *path, now time.Time) (time.Duration, bo
 		return 0, false
 	}
 	base, ok := p.tunnel.median(now, m.c)
+	if m.nat != nil && p.phase == "active" && p.selected != nil && p.selected.nat && !c.nat {
+		base, ok = p.hub.median(now, m.c)
+	}
 	lan, ready := c.stats.median(now, m.c)
 	compare := base
-	if p.phase == "active" {
+	if p.phase == "active" && !(m.nat != nil && p.selected.nat && !c.nat) {
 		// Compare LAN with LAN. Tunnel overhead must not favor another alias.
 		var measured bool
 		compare, measured = p.selected.stats.median(now, m.c)
 		ok = ok && measured
 	}
 	return base, ok && ready && m.fresh(c, now) && improves(lan, compare, m.c)
+}
+
+// Leave enough time for ICE discovery and a full direct-path trial before
+// retrying a LAN endpoint whose control path worked but whose route failed.
+func (m *mesh) failLAN(p *meshPeer, c *path, now time.Time) {
+	if m.nat == nil || c == nil {
+		return
+	}
+	until := now.Add(max(2*time.Minute, 2*time.Duration(m.c.Window)+30*time.Second))
+	if !c.nat {
+		c.retryAt = until
+	}
+	ip := c.addr.Addr().Unmap()
+	links := append([]linkAddr{c.link}, m.links...)
+	for _, link := range links {
+		if ip.Is4() && link.Prefix.Contains(ip) {
+			c.retryAt = until
+			failed := m.nat.failedLAN[p.spec.key]
+			if failed == nil {
+				failed = make(map[netip.Addr]time.Time)
+				m.nat.failedLAN[p.spec.key] = failed
+			}
+			m.excludedLAN(p.spec.key, now)
+			if len(failed) < 16 || !failed[ip].IsZero() {
+				failed[ip] = until
+			} else {
+				// An untracked failure can be selected through another port.
+				// Pause NAT until every live failure window has ended.
+				for _, deadline := range failed {
+					if deadline.After(until) {
+						until = deadline
+					}
+				}
+				if until.After(m.nat.failedLANUntil[p.spec.key]) {
+					m.nat.failedLANUntil[p.spec.key] = until
+				}
+			}
+			if now.Before(m.nat.failedLANUntil[p.spec.key]) && until.After(m.nat.failedLANUntil[p.spec.key]) {
+				m.nat.failedLANUntil[p.spec.key] = until
+			}
+			break
+		}
+	}
+}
+
+func (m *mesh) pathFailure(p *meshPeer, now time.Time, reason string) error {
+	m.failLAN(p, p.selected, now)
+	return m.rollback(p, now, reason)
 }
 
 func (m *mesh) tick(now time.Time) error {
@@ -607,7 +678,7 @@ func (m *mesh) tick(now time.Time) error {
 		}
 		var session [16]byte
 		for name, c := range p.paths {
-			if now.Sub(c.stats.since) > time.Duration(m.c.Failure) && !m.fresh(c, now) && c != p.selected {
+			if now.Sub(c.stats.since) > time.Duration(m.c.Failure) && !m.fresh(c, now) && c != p.selected && !now.Before(c.retryAt) {
 				delete(p.paths, name)
 				continue
 			}
@@ -631,6 +702,12 @@ func (m *mesh) tick(now time.Time) error {
 				p.tunnel.since = now
 			}
 			m.ping(p, nil, session, false, now)
+			if m.nat != nil && m.directTunnel.Index > 0 && (p.phase == "trial" || p.phase == "active") {
+				if p.hub.since.IsZero() {
+					p.hub.since = now
+				}
+				m.probePath(p, nil, session, false, true, now)
+			}
 		}
 		checkedAt := now.Add(time.Since(started))
 		if p.phase != "" {
@@ -783,6 +860,7 @@ func (m *mesh) coordinate(p *meshPeer, c *path, msg message, now time.Time) erro
 	}
 	if r := p.replacement; r != nil && r.path == c && r.token == msg.Token {
 		if !m.fresh(c, now) || now.Sub(r.since) >= time.Duration(m.c.Failure) {
+			m.failLAN(p, c, now)
 			m.cancelReplacement(p, now)
 			return nil
 		}
@@ -807,6 +885,7 @@ func (m *mesh) coordinate(p *meshPeer, c *path, msg message, now time.Time) erro
 				}
 			}
 		case "abort":
+			m.failLAN(p, c, now)
 			m.cancelReplacement(p, now)
 		}
 		return nil
@@ -865,7 +944,7 @@ func (m *mesh) coordinate(p *meshPeer, c *path, msg message, now time.Time) erro
 	case "hold":
 		p.remoteGood = false
 	case "abort":
-		return m.rollback(p, now, "remote rollback")
+		return m.pathFailure(p, now, "remote rollback")
 	}
 	return nil
 }
@@ -891,13 +970,16 @@ func (m *mesh) apply(p *meshPeer, now time.Time) error {
 			return nil // A key change cancelled this replacement during preflight.
 		}
 		if !m.fresh(r.path, checkedAt) || checkedAt.Sub(r.since) >= time.Duration(m.c.Failure) {
+			m.failLAN(p, r.path, checkedAt)
 			m.cancelReplacement(p, checkedAt)
 			return nil
 		}
 		if !m.fresh(p.selected, checkedAt) {
+			m.failLAN(p, p.selected, checkedAt)
 			return m.restore(p, checkedAt, "LAN health timeout")
 		}
 		if checkedAt.Sub(p.lastTunnel) >= time.Duration(m.c.Failure) {
+			m.failLAN(p, p.selected, checkedAt)
 			return m.restore(p, checkedAt, "WireGuard health timeout")
 		}
 		c, token = r.path, r.token
@@ -906,9 +988,13 @@ func (m *mesh) apply(p *meshPeer, now time.Time) error {
 		return nil // A key change cancelled this coordination round.
 	}
 	if r == nil && (!m.fresh(c, checkedAt) || checkedAt.Sub(p.since) >= time.Duration(m.c.Failure)) {
+		m.failLAN(p, c, checkedAt)
 		return m.restore(p, checkedAt, "coordination timeout")
 	}
 	if err := m.control.Apply(p.spec.key, p.spec.IP, p.spec.psk, netip.AddrPortFrom(c.addr.Addr(), c.port)); err != nil {
+		if errors.Is(err, errEndpointRoamed) {
+			return nil // Retry within the existing coordination deadline.
+		}
 		m.pathCommand(p, c, token, "abort", now.Add(time.Since(started)))
 		return fmt.Errorf("apply direct path for %s: %w", p.spec.IP, err)
 	}
@@ -922,6 +1008,7 @@ func (m *mesh) apply(p *meshPeer, now time.Time) error {
 	now = now.Add(time.Since(started))
 	p.phase, p.since = "trial", now
 	p.resumed = time.Time{}
+	p.endpointSince = time.Time{}
 	p.tunnel, p.lastTunnel = measurements{since: now}, time.Time{}
 	p.pending = make(map[string]probe) // Do not count probes from the old route.
 	if leader {
@@ -931,16 +1018,75 @@ func (m *mesh) apply(p *meshPeer, now time.Time) error {
 	return nil
 }
 
+// A valid WireGuard packet can roam a peer back to its old WAN endpoint.
+// Keep normal LAN selection tied to the kernel endpoint, not only the control
+// session. NAT paths retain normal WireGuard roaming for public-port changes.
+func (m *mesh) keepLANEndpoint(p *meshPeer, now time.Time) (bool, error) {
+	c := p.selected
+	if m.nat == nil || m.c.DirectInterface == "" || c == nil || c.nat || (p.phase != "trial" && p.phase != "active") {
+		return true, nil
+	}
+	control, ok := m.control.(interface {
+		EnsureEndpoint(wgtypes.Key, netip.Addr, wgtypes.Key, netip.AddrPort) (bool, error)
+	})
+	if !ok {
+		return false, errors.New("route controller cannot maintain the LAN endpoint")
+	}
+	started := time.Now()
+	if m.verify != nil {
+		if err := m.verify(); err != nil {
+			return false, err
+		}
+	}
+	if valid, err := m.pollPSK(p, now.Add(time.Since(started))); err != nil || !valid {
+		return false, err
+	}
+	if p.selected != c || (p.phase != "trial" && p.phase != "active") {
+		return false, nil // Key preflight restored or changed this path.
+	}
+	changed, err := control.EnsureEndpoint(p.spec.key, p.spec.IP, p.spec.psk, netip.AddrPortFrom(c.addr.Addr(), c.port))
+	if err != nil && !errors.Is(err, errEndpointRoamed) {
+		return false, err
+	}
+	changed = changed || errors.Is(err, errEndpointRoamed)
+	if !changed {
+		p.endpointSince = time.Time{}
+		return true, nil
+	}
+	now = now.Add(time.Since(started))
+	if p.endpointSince.IsZero() {
+		p.endpointSince = now
+	}
+	if now.Sub(p.endpointSince) >= time.Duration(m.c.Failure) {
+		return false, m.pathFailure(p, now, "LAN endpoint kept roaming")
+	}
+	if p.phase == "active" {
+		p.phase, p.since = "trial", now
+	}
+	// None of the old samples proves that traffic used the chosen LAN. Keep
+	// the overall trial deadline, but require a new measurement window.
+	p.tunnel, p.lastTunnel = measurements{since: now}, time.Time{}
+	p.localGood, p.remoteGood, p.remoteAt = false, false, time.Time{}
+	p.pending = make(map[string]probe)
+	p.resumed = p.endpointSince
+	m.command(p, "hold", now)
+	return false, nil
+}
+
 func (m *mesh) advance(p *meshPeer, now time.Time) error {
 	if !m.fresh(p.selected, now) {
-		return m.rollback(p, now, "LAN health timeout")
+		return m.pathFailure(p, now, "LAN health timeout")
 	}
 	if p.rekey != nil {
 		return m.advanceRekey(p, now)
 	}
+	if ready, err := m.keepLANEndpoint(p, now); err != nil || !ready {
+		return err
+	}
 	switch p.phase {
 	case "prepare", "prepared":
 		if now.Sub(p.since) >= time.Duration(m.c.Failure) {
+			m.failLAN(p, p.selected, now)
 			return m.restore(p, now, "coordination timeout")
 		}
 		if p.phase == "prepare" {
@@ -963,7 +1109,7 @@ func (m *mesh) advance(p *meshPeer, now time.Time) error {
 			last = p.resumed
 		}
 		if now.Sub(last) >= time.Duration(m.c.Failure) {
-			return m.rollback(p, now, "WireGuard health timeout")
+			return m.pathFailure(p, now, "WireGuard health timeout")
 		}
 		if !p.committed && bytes.Compare(m.public[:], p.spec.key[:]) < 0 {
 			m.command(p, "commit", now)
@@ -972,15 +1118,15 @@ func (m *mesh) advance(p *meshPeer, now time.Time) error {
 			p.localGood = false
 			if rtt, ok := p.tunnel.median(now, m.c); ok {
 				if !improves(rtt, p.baseline, m.c) {
-					return m.rollback(p, now, "trial did not improve RTT")
+					return m.pathFailure(p, now, "trial did not improve RTT")
 				}
 				p.localGood = true
-			} else if now.Sub(p.since) >= time.Duration(m.c.Window) {
-				return m.rollback(p, now, "trial packet loss")
+			} else if now.Sub(p.tunnel.since) >= time.Duration(m.c.Window) {
+				return m.pathFailure(p, now, "trial packet loss")
 			}
 			// Accommodate the maximum supported remote window (one minute).
 			if now.Sub(p.since) > 2*time.Minute {
-				return m.rollback(p, now, "trial confirmation timeout")
+				return m.pathFailure(p, now, "trial confirmation timeout")
 			}
 			if p.localGood && p.remoteGood && now.Sub(p.remoteAt) < time.Duration(m.c.Failure) && p.committed {
 				if p.previous != nil {
@@ -1000,6 +1146,7 @@ func (m *mesh) advance(p *meshPeer, now time.Time) error {
 	}
 	if r := p.replacement; r != nil {
 		if !m.fresh(r.path, now) || now.Sub(r.since) >= time.Duration(m.c.Failure) {
+			m.failLAN(p, r.path, now)
 			m.cancelReplacement(p, now)
 		} else if r.phase == "prepare" {
 			m.pathCommand(p, r.path, r.token, "prepare", now)
@@ -1059,6 +1206,7 @@ func (m *mesh) restore(p *meshPeer, now time.Time, reason string) error {
 		p.previous = nil
 	}
 	p.selected, p.phase, p.trial = nil, "", ""
+	p.endpointSince = time.Time{}
 	p.localGood, p.remoteGood, p.committed = false, false, false
 	p.rekey, p.completedRekey, p.remoteRekey = nil, nil, false
 	p.cooldown = now.Add(time.Duration(m.c.Cooldown))
